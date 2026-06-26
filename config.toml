@@ -1,0 +1,13 @@
+[server]
+socket_path = "/run/rr-proxy/rr-proxy.sock"
+socket_perms = "0666"
+
+[database]
+db_path = "/opt/rr-proxy/indexer_rocksdb"
+
+[tuning]
+max_background_jobs = 4
+write_buffer_size_mb = 64
+max_open_files = 10000
+max_input_size = 16777216
+block_cache_size_mb = 128
