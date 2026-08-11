@@ -1,34 +1,90 @@
-# Rust RocksDB Proxy (`rr-proxy`)
+# PiNS RocksDB & Sparse Merkle Tree Daemon (`rr-proxy`)
 
-A lightweight, high-performance Unix socket proxy for RocksDB written in Rust. It is designed to expose RocksDB to environments that lack native thread-safe or high-performance RocksDB bindings (such as PHP), providing fast, concurrent, and transactional access over a Unix domain socket.
+A lightweight, high-performance Unix socket daemon written in Rust. It owns the **Sparse Merkle Tree (SMT)** behind the PiNS name service and exposes it to clients that lack native thread-safe or high-performance RocksDB bindings (such as PHP), over a binary protocol on a Unix domain socket.
 
-## SMT Handling in PIVX.Name Service
+## SMT Handling in the PiNS Name Service
 
-This proxy is a core component of the **PIVX.Name Service (PiNS)**, where it handles the underlying storage for the **Sparse Merkle Tree (SMT)**. 
+Sparse Merkle Trees generate cryptographic proofs and rewrite tree structure across many operations per block, so they need low-latency reads and writes. During a single update sequence, parent nodes must be read immediately after being written but before the batch is committed.
 
-Because Sparse Merkle Trees require generating cryptographic proofs and updating tree structure via thousands of operations per block, they require low-latency reads and writes. Furthermore, during a single tree update sequence, parent nodes must be read immediately after being updated, but before the entire batch is committed. 
+**Tree traversal lives in the daemon**, not in the client. A domain update or a proof is a single round trip rather than the ~380 a client-side tree walk required, the 128-level walk runs in native code, and a proof is always served with the root it was built from — from one database snapshot, so the two can never describe different states.
 
-To solve this, `rr-proxy` implements a transactional batch mode with a **Shadow Cache** providing **Read-Your-Own-Writes (RYOW)** capability. This allows the client to perform intermediate lookups within a transaction block, retrieving uncommitted values directly from the proxy's memory, before atomically committing the final state to RocksDB.
+Leaf hashing also lives here. Clients send record *fields*, never a precomputed hash, so the leaf format has exactly one implementation — shared with the on-chain prover. The test suite pins the tree's traversal, bit order and leaf format against a transcription of the prover's own verifier, so a divergence fails a test instead of silently producing proofs that fail on-chain.
 
 ## Features
 
-- **Asynchronous & Concurrent**: Built on Tokio, spawning dedicated task handlers for concurrent client connections.
-- **Transactional Write Batches**: Supports atomic writes using RocksDB `WriteBatch`.
-- **Read-Your-Own-Writes (RYOW)**: A temporary transaction-scoped shadow cache allows reading values queued in the current batch before commitment.
-- **Tuned for Performance**: Supports configuration for background jobs, write buffer sizes, LRU block cache size, and Bloom Filters to optimize lookup speeds.
-- **Graceful Lifecycle Management**: Cleans up socket files upon system shutdowns or process interruption (SIGTERM/SIGINT).
+- **Asynchronous & Concurrent**: Built on Tokio, spawning dedicated task handlers for concurrent client connections. Blocking database work runs on the blocking pool.
+- **Native Sparse Merkle Tree**: Update, proof, leaf lookup and state verification are single commands.
+- **Atomic Spine Writes**: An update rewrites 129 nodes; they always land as one atomic batch, whether or not a transaction is open.
+- **Transactional Write Batches**: Atomic writes via RocksDB `WriteBatch`, with `fsync` on commit so an acknowledged commit survives power loss.
+- **Read-Your-Own-Writes (RYOW)**: A transaction-scoped overlay makes queued nodes visible to later reads on the same connection before commitment.
+- **Snapshot-Consistent Proofs**: `SMT_PROOF` returns the root and all 128 siblings from a single snapshot.
+- **Compact Storage**: Node keys are packed path bits (17 bytes at the leaf, versus 128 ASCII characters) and values are raw 32-byte hashes.
+- **Tuned for Performance**: Configurable background jobs, write buffer size, LRU block cache, and bloom filters covering both SST and memtable reads.
+- **Graceful Lifecycle Management**: Stops accepting, flushes RocksDB and cleans up the socket on SIGTERM/SIGINT.
+
+> [!IMPORTANT]
+> Batches are **atomic** and provide read-your-own-writes **per connection**, but the daemon does not provide *isolation* between concurrent writers — there is no conflict detection, and two connections batching the same keys will produce a lost update. Each tree (indexer, registrar) runs its own instance against its own database, with a **single writer** each.
 
 ## Socket Protocol
 
-The proxy communicates via a line-based text protocol over a Unix socket. Fields are separated by the pipe character (`|`).
+A binary, length-prefixed protocol. Every frame is a 5-byte header followed by an opaque payload:
 
-| Command | Arguments | Response | Description |
+```text
+Request:   [u8 opcode][u32 length][payload]
+Response:  [u8 status][u32 length][payload]
+```
+
+Lengths are **big-endian** (`pack('N', …)` in PHP). Because payloads are length-prefixed rather than delimited, keys and values may contain **any byte** — there is nothing to escape, no reserved characters, and a stored value can never be mistaken for a status code.
+
+Every request produces exactly one response, including unrecognised opcodes (`BAD_COMMAND`), so the request/response lockstep cannot desynchronise. A payload larger than `max_input_size` is rejected from the header alone, before anything is allocated.
+
+### Status codes
+
+| Code | Name | Meaning |
+| :--- | :--- | :--- |
+| `0x00` | `OK` | Success; payload holds the result, if any |
+| `0x01` | `NOT_FOUND` | Key or leaf absent, or a verification mismatch |
+| `0x02` | `ERROR` | Payload holds a UTF-8 diagnostic message |
+| `0x03` | `BAD_COMMAND` | Unknown opcode or malformed payload |
+| `0x04` | `QUEUED` | Accepted into the open batch |
+| `0x05` | `BATCH_TOO_LARGE` | Batch entry limit reached; commit and continue |
+| `0x06` | `ALREADY_IN_BATCH` | A batch is already open on this connection |
+
+### Sparse Merkle Tree commands
+
+| Op | Name | Payload | Response payload |
 | :--- | :--- | :--- | :--- |
-| `GET` | `<key>` | `<value>` \| `NOT_FOUND` \| `ERROR` | Retrieve the value for a key. If in an active batch, checks the shadow cache first. |
-| `PUT` | `<key>\|<value>` | `OK` \| `QUEUED` \| `ERROR` | Put key-value pair. Returns `QUEUED` if in a batch, or writes immediately and returns `OK` if not. |
-| `BATCH_START` | None | `OK` | Start a new transaction batch and initialize shadow cache. |
-| `BATCH_COMMIT` | None | `OK` \| `ERROR` \| `BAD_COMMAND` | Atomically commit the current batch to disk and close the transaction. |
-| `CLEAR` | None | `OK` \| `ERROR` | Wipe all keys from the database and clear active transaction state. |
+| `0x40` | `SMT_ROOT` | — | 32-byte root |
+| `0x41` | `SMT_LEAF` | domain | 32-byte leaf, or `NOT_FOUND` |
+| `0x42` | `SMT_UPDATE` | record | 32-byte new root |
+| `0x43` | `SMT_PROOF` | domain | `[32-byte root][128 × 32-byte siblings]` (4128 bytes), deepest sibling first |
+| `0x44` | `SMT_VERIFY` | record | empty; `OK` if the stored leaf matches the record, else `NOT_FOUND` |
+
+A **record** is the domain's full state, from which the daemon derives the leaf hash:
+
+```text
+[32 pubkey][u64 price][u64 nonce][u32 addr_len][target_address][domain]
+```
+
+Integers are big-endian on the wire and converted to little-endian inside the hash, matching the prover. Fixed-width fields lead, so the trailing domain needs no length of its own.
+
+### Key/value and administrative commands
+
+Raw key/value access is retained for maintenance and diagnostics; normal operation uses the SMT commands above.
+
+| Op | Name | Payload | Response payload |
+| :--- | :--- | :--- | :--- |
+| `0x01` | `PING` | — | empty |
+| `0x02` | `STATS` | — | UTF-8 `keys=… memtables=… …` |
+| `0x10` | `GET` | key | value, or `NOT_FOUND` |
+| `0x11` | `PUT` | `[u32 keylen][key][value]` | empty |
+| `0x12` | `DELETE` | key | empty |
+| `0x20` | `BATCH_START` | — | empty |
+| `0x21` | `BATCH_COMMIT` | — | empty |
+| `0x22` | `BATCH_ABORT` | — | empty |
+| `0x30` | `CLEAR` | — | empty |
+
+`CLEAR` wipes every key with a range delete and then compacts, so on a large database it can take a while — size the client read timeout accordingly. It is refused while a batch is open on the connection.
 
 ## Configuration
 
@@ -37,10 +93,16 @@ The proxy is configured via a TOML file. Below is an example configuration file:
 ```toml
 [server]
 socket_path = "/run/rr-proxy/rr-proxy.sock"
-socket_perms = "0666"
+socket_perms = "0660"
+
+[logging]
+# Optional. When unset, logs go to stdout (captured by journald under systemd).
+log_file = "/opt/rr-proxy/logs/rr-proxy.log"
+level = "info"
 
 [database]
-db_path = "/opt/rr-proxy/db"
+db_path = "/opt/rr-proxy/db/indexer_rocksdb"
+create_if_missing = false
 
 [tuning]
 max_background_jobs = 4
@@ -48,7 +110,18 @@ write_buffer_size_mb = 64
 max_open_files = 10000
 max_input_size = 16777216
 block_cache_size_mb = 128
+sync_on_commit = true
+max_batch_entries = 1000000
 ```
+
+| Key | Default | Notes |
+| :--- | :--- | :--- |
+| `server.socket_perms` | — | Octal, e.g. `"0660"`. A malformed value is a fatal error, never a silent fallback to the umask. |
+| `logging.log_file` | stdout | Opened with `O_APPEND`, so logrotate `copytruncate` is safe. |
+| `logging.level` | `info` | `trace` \| `debug` \| `info` \| `warn` \| `error`. |
+| `database.create_if_missing` | `false` | Kept off so a mistyped path or unmounted volume fails loudly instead of serving an empty tree. Set `true` once, for first-run initialisation. |
+| `tuning.sync_on_commit` | `true` | `fsync` the WAL on `BATCH_COMMIT`. Required for the indexer's MySQL XA two-phase commit to stay consistent across a power loss. Costs one `fsync` per checkpoint. |
+| `tuning.max_batch_entries` | `1000000` | Caps daemon memory held by an open batch. Past this the client receives `BATCH_TOO_LARGE` and should commit and continue. |
 
 ## Running the Proxy
 
@@ -64,7 +137,7 @@ Run manually (note that the `--config` parameter is required):
 
 ## Systemd Service Deployment
 
-A systemd service unit template is provided in [contrib/rr-proxy.service](file:///home/alexey/myProjects/my-misc/www/rr_proxy/contrib/rr-proxy.service) to run the proxy as a daemon. 
+A systemd service unit template is provided in [contrib/rr-proxy.service](contrib/rr-proxy.service) to run the proxy as a daemon. 
 
 ### Installation Steps
 
@@ -76,17 +149,27 @@ A systemd service unit template is provided in [contrib/rr-proxy.service](file:/
 
 2. Copy the configuration file to `/opt/rr-proxy/config.toml` and configure your paths. Ensure the `socket_path` is set to `/run/rr-proxy/rr-proxy.sock`:
    ```bash
-   sudo cp config-indexer.toml /opt/rr-proxy/config.toml
+   sudo cp config.toml /opt/rr-proxy/config.toml
    ```
 
-3. Copy the service file to `/etc/systemd/system/`:
+3. Create the database and log directories, owned by the service user:
+   ```bash
+   sudo mkdir -p /opt/rr-proxy/db /opt/rr-proxy/logs
+   ```
+
+4. Copy the service file to `/etc/systemd/system/`:
    ```bash
    sudo cp contrib/rr-proxy.service /etc/systemd/system/
    ```
 
-4. Edit the `/etc/systemd/system/rr-proxy.service` file to replace `{{USER}}` and `{{GROUP}}` with the appropriate user and group names.
-   
-5. Reload systemd, enable, and start the service:
+5. Edit the `/etc/systemd/system/rr-proxy.service` file to replace `{{USER}}` and `{{GROUP}}` with the appropriate user and group names.
+
+6. Install the log rotation policy and replace the same placeholders:
+   ```bash
+   sudo cp contrib/rr-proxy.logrotate /etc/logrotate.d/rr-proxy
+   ```
+
+7. Reload systemd, enable, and start the service:
    ```bash
    sudo systemctl daemon-reload
    sudo systemctl enable rr-proxy
@@ -94,7 +177,10 @@ A systemd service unit template is provided in [contrib/rr-proxy.service](file:/
    ```
 
 > [!NOTE]
-> The service utilizes `RuntimeDirectory=rr-proxy` which configures systemd to automatically create `/run/rr-proxy/` (owned by your configured `User`/`Group` with mode `0755` permissions) before launching the binary, and clean it up when the daemon stops.
+> The service utilizes `RuntimeDirectory=rr-proxy` which configures systemd to automatically create `/run/rr-proxy/` (owned by your configured `User`/`Group` with mode `0750` permissions) before launching the binary, and clean it up when the daemon stops.
+
+> [!IMPORTANT]
+> The socket is created with mode `0660`, so **client processes must belong to the configured `Group`** to connect. The `ReadWritePaths=` entries in the unit file must also match `database.db_path` and `logging.log_file` in `config.toml` — under `ProtectSystem=strict` any path not listed is mounted read-only, and the daemon will fail to open its database.
 
 ## License
 

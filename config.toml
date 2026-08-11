@@ -1,9 +1,30 @@
+# Two instances of this daemon run per deployment - one for the indexer's tree, one for
+# the registrar's - each with its own socket and its own database. Copy this file per
+# instance; the paths below are the INDEXER instance, and must match
+# INDEXER_ROCKSDB_PROXY_SOCKET_PATH in the PHP client's config. The registrar instance
+# uses pivx-registrar.sock and its own db_path.
+#
+# The names are coin-specific on purpose: a ZCash Name deployment on the same host uses
+# zcash-*.sock, so nothing collides.
+
 [server]
-socket_path = "/run/rr-proxy/rr-proxy.sock"
-socket_perms = "0666"
+socket_path = "/run/rr-proxy/pivx-indexer.sock"
+# Restricted to the owning user and group. Widen only if a client runs as another
+# user, and prefer adding that user to the group instead.
+socket_perms = "0660"
+
+[logging]
+# Optional. When unset, logs go to stdout (captured by journald under systemd).
+# The file is opened with O_APPEND, so logrotate's `copytruncate` is safe.
+log_file = "/opt/rr-proxy/logs/pivx-indexer.log"
+# trace | debug | info | warn | error
+level = "info"
 
 [database]
-db_path = "/opt/rr-proxy/indexer_rocksdb"
+db_path = "/opt/rr-proxy/db/pivx_indexer_rocksdb"
+# Kept false so a mistyped path or an unmounted volume fails loudly instead of
+# silently creating an empty tree. Set true once, for first-run initialisation.
+create_if_missing = false
 
 [tuning]
 max_background_jobs = 4
@@ -11,3 +32,15 @@ write_buffer_size_mb = 64
 max_open_files = 10000
 max_input_size = 16777216
 block_cache_size_mb = 128
+# fsync the WAL on BATCH_COMMIT. Required for the indexer's MySQL XA two-phase
+# commit to stay consistent across a power loss. Costs one fsync per checkpoint.
+sync_on_commit = true
+# Caps daemon memory held by an open batch. The client receives BATCH_TOO_LARGE
+# past this point and should commit and continue.
+max_batch_entries = 1000000
+# Concurrent client connections. Further connections are closed immediately
+# rather than left hanging.
+max_connections = 64
+# On SIGTERM the daemon stops accepting and lets in-flight requests finish.
+# Idle connections close at once; this bounds the wait for busy ones.
+shutdown_drain_secs = 15

@@ -4,7 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-# Placeholders for the system user and group running the daemon
+# Placeholders for the system user and group running the daemon.
+# Clients (indexer, registrar) must belong to {{GROUP}} to reach the 0660 socket.
 User={{USER}}
 Group={{GROUP}}
 
@@ -14,16 +15,29 @@ ExecStart=/opt/rr-proxy/rr-proxy --config /opt/rr-proxy/config.toml
 # Automatically creates /run/rr-proxy/ owned by User:Group
 # with the specified permissions, and removes it when the service stops.
 RuntimeDirectory=rr-proxy
-RuntimeDirectoryMode=0755
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 
 # Restart service if it crashes
 Restart=on-failure
 RestartSec=5s
 
+# On SIGTERM the daemon stops accepting, flushes RocksDB memtables and unlinks the
+# socket. Give it room to finish rather than being SIGKILLed mid-flush.
+TimeoutStopSec=60s
+
+# RocksDB is configured with max_open_files = 10000; without a matching limit it
+# will hit the inherited ceiling, and fd exhaustion degrades the accept loop.
+LimitNOFILE=65535
+
 # Security and sandboxing recommendations
 ProtectSystem=strict
-ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# Both paths must be writable: the database, and the log file directory.
+# These must agree with database.db_path and logging.log_file in config.toml.
 ReadWritePaths=/opt/rr-proxy/db
+ReadWritePaths=/opt/rr-proxy/logs
 
 [Install]
 WantedBy=multi-user.target

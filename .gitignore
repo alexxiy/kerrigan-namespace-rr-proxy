@@ -1,2 +1,7 @@
 /.idea/
 /target/
+
+# Working notes and internal audit tracking, not documentation
+/.claude/
+CLAUDE.md
+CODE_REVIEW.md

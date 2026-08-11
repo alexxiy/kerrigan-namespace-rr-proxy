@@ -1,0 +1,18 @@
+# logrotate configuration for rr-proxy.
+# Install as /etc/logrotate.d/rr-proxy and replace {{USER}} / {{GROUP}}.
+#
+# `copytruncate` is used deliberately: the daemon holds its log file open for the
+# life of the process and has no reopen signal. Because the file is opened with
+# O_APPEND, writes always target the current end of file, so truncation is safe and
+# does not leave a sparse hole.
+
+/opt/rr-proxy/logs/rr-proxy.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 0640 {{USER}} {{GROUP}}
+}
