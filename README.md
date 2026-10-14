@@ -6,7 +6,7 @@ A lightweight, high-performance Unix socket daemon written in Rust. It owns the 
 
 Sparse Merkle Trees generate cryptographic proofs and rewrite tree structure across many operations per block, so they need low-latency reads and writes. During a single update sequence, parent nodes must be read immediately after being written but before the batch is committed.
 
-**Tree traversal lives in the daemon**, not in the client. A domain update or a proof is a single round trip rather than the ~380 a client-side tree walk required, the 128-level walk runs in native code, and a proof is always served with the root it was built from — from one database snapshot, so the two can never describe different states.
+**Tree traversal lives in the daemon**, not in the client. A domain update or a proof is a single round trip rather than the many a client-side tree walk required, the tree walk runs in native code, and a proof is always served with the root it was built from — from one database snapshot, so the two can never describe different states.
 
 Leaf hashing also lives here. Clients send record *fields*, never a precomputed hash, so the leaf format has exactly one implementation — shared with the on-chain prover. The test suite pins the tree's traversal, bit order and leaf format against a transcription of the prover's own verifier, so a divergence fails a test instead of silently producing proofs that fail on-chain.
 
@@ -14,10 +14,10 @@ Leaf hashing also lives here. Clients send record *fields*, never a precomputed 
 
 - **Asynchronous & Concurrent**: Built on Tokio, spawning dedicated task handlers for concurrent client connections. Blocking database work runs on the blocking pool.
 - **Native Sparse Merkle Tree**: Update, proof, leaf lookup and state verification are single commands.
-- **Atomic Spine Writes**: An update rewrites 129 nodes; they always land as one atomic batch, whether or not a transaction is open.
+- **Atomic Spine Writes**: An update rewrites only the nodes on the domain's path — the leaf plus the ~log2(N) nodes above it (the spine); they always land as one atomic batch, whether or not a transaction is open.
 - **Transactional Write Batches**: Atomic writes via RocksDB `WriteBatch`, with `fsync` on commit so an acknowledged commit survives power loss.
 - **Read-Your-Own-Writes (RYOW)**: A transaction-scoped overlay makes queued nodes visible to later reads on the same connection before commitment.
-- **Snapshot-Consistent Proofs**: `SMT_PROOF` returns the root and all 128 siblings from a single snapshot.
+- **Snapshot-Consistent Proofs**: `SMT_PROOF` returns the root and the path's siblings (~log2(N), variable) from a single snapshot.
 - **Compact Storage**: Node keys are packed path bits (17 bytes at the leaf, versus 128 ASCII characters) and values are raw 32-byte hashes.
 - **Tuned for Performance**: Configurable background jobs, write buffer size, LRU block cache, and bloom filters covering both SST and memtable reads.
 - **Graceful Lifecycle Management**: Stops accepting, flushes RocksDB and cleans up the socket on SIGTERM/SIGINT.
@@ -57,7 +57,7 @@ Every request produces exactly one response, including unrecognised opcodes (`BA
 | `0x40` | `SMT_ROOT` | — | 32-byte root |
 | `0x41` | `SMT_LEAF` | domain | 32-byte leaf, or `NOT_FOUND` |
 | `0x42` | `SMT_UPDATE` | record | 32-byte new root |
-| `0x43` | `SMT_PROOF` | domain | `[32-byte root][128 × 32-byte siblings]` (4128 bytes), deepest sibling first |
+| `0x43` | `SMT_PROOF` | domain | variable-length compact proof (see below) |
 | `0x44` | `SMT_VERIFY` | record | empty; `OK` if the stored leaf matches the record, else `NOT_FOUND` |
 
 A **record** is the domain's full state, from which the daemon derives the leaf hash:
@@ -67,6 +67,20 @@ A **record** is the domain's full state, from which the daemon derives the leaf 
 ```
 
 Integers are big-endian on the wire and converted to little-endian inside the hash, matching the prover. Fixed-width fields lead, so the trailing domain needs no length of its own.
+
+#### `SMT_PROOF` response format
+
+A proof is **variable length**: the compact tree carries only the siblings on the domain's path (~log2(N)), not a fixed 128-level ladder.
+
+```text
+[32-byte root][u8 depth][u8 terminal][depth × 32-byte siblings]
+```
+
+- `depth` is the number of siblings that follow (`0..=128`); siblings are **deepest first**.
+- `terminal` tags the leaf slot the path reached: `0x00` OCCUPIED, `0x01` VACANT, `0x02` BLOCKED.
+- A **BLOCKED** (`0x02`) proof is followed by the blocking domain's full **record** (the layout above). The whole preimage is sent, not just a key, because the circuit must derive the blocking key from the same bytes that produce its leaf hash (see `pivx-name-prover/docs/compact-smt.md` §5.3).
+
+The leaf's own hash is never sent — the client recomputes it from the record and rehashes up through the siblings to check the root.
 
 ### Key/value and administrative commands
 

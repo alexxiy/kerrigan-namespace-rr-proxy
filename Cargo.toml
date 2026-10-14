@@ -10,11 +10,11 @@ path = "src/main.rs"
 [dependencies]
 rocksdb = "0.24.0"
 
-# The protocol's hash rules — leaf hashing, node hashing, path derivation and the
-# empty-subtree ladder — come from the same crate the prover's guest circuit uses.
-# Agreement with the circuit is therefore a compile-time property rather than a
-# convention maintained by hand, which is what the `agrees_with_prover_traversal`
-# and `default_hashes_come_from_the_shared_ladder` tests pin down.
+# The protocol's hash rules — leaf hashing, node hashing and path derivation — come from
+# the same crate the prover's guest circuit uses. Agreement with the circuit is therefore a
+# compile-time property rather than a convention maintained by hand, which is what the
+# `proof_verifies_under_the_provers_traversal` and `registration_proofs_agree_with_the_circuit`
+# tests pin down.
 #
 # default-features = false: this daemon only speaks the tree. The address-validation
 # (bech32) and signature (ed25519-dalek) stacks are the circuit's business and

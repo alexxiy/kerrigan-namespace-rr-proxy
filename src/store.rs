@@ -61,7 +61,7 @@ impl From<rocksdb::Error> for StoreError {
 pub struct RocksStore<'a> {
     db: &'a DB,
     /// When set, all committed reads come from this fixed point in time, so a
-    /// multi-node read (a 128-level proof) cannot tear across a concurrent
+    /// multi-node read (a proof of ~log2(N) nodes) cannot tear across a concurrent
     /// commit. Short-lived by construction: it never outlives one operation.
     snapshot: Option<SnapshotWithThreadMode<'a, DB>>,
     overlay: PendingBatch,

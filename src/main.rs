@@ -5,8 +5,8 @@
 //! RocksDB bindings (notably PHP).
 //!
 //! Tree traversal lives here rather than in the client. A domain update or proof
-//! costs one round trip instead of the ~380 a client-side implementation needs,
-//! the 128-level walk runs in native code, and a proof is served with its root
+//! costs one round trip instead of the many a client-side implementation needs,
+//! the tree walk runs in native code, and a proof is served with its root
 //! from a single snapshot — so the two can never disagree.
 //!
 //! Batches are atomic and provide read-your-own-writes per connection, but the
@@ -845,7 +845,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     info!("RocksDB opened at {}", config.database.db_path);
 
-    // Default hashes are computed once and shared by every connection.
+    // The tree itself is stateless (the compact tree holds no precomputed hashes); one
+    // shared instance serves every connection.
     let tree = Arc::new(Smt::new());
 
     // ---- Socket ----
