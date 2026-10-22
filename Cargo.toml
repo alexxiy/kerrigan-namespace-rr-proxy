@@ -1,6 +1,6 @@
 [package]
 name = "pivx-name-rr-proxy"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 
 [[bin]]
@@ -8,7 +8,7 @@ name = "rr-proxy"
 path = "src/main.rs"
 
 [dependencies]
-rocksdb = "0.24.0"
+rocksdb = "0.25.0"
 
 # The protocol's hash rules — leaf hashing, node hashing and path derivation — come from
 # the same crate the prover's guest circuit uses. Agreement with the circuit is therefore a
@@ -25,7 +25,7 @@ rocksdb = "0.24.0"
 # on-chain vKey are provably built from the same protocol revision.
 pins-core = { path = "../pivx-name-prover/pins-core", default-features = false }
 # Only the runtime pieces this daemon actually uses.
-tokio = { version = "1.53.1", features = [
+tokio = { version = "1.54.1", features = [
     "rt-multi-thread",
     "net",
     "io-util",
@@ -38,9 +38,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # For configuration parsing
 serde = { version = "1.0.229", features = ["derive"] }
-toml = "1.1.3"
+toml = "1.1.8"
 # CLI parser
-clap = { version = "4.6.4", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 
 [dev-dependencies]
 # Used only to emit cross-check vectors for the PHP client (see the ignored
@@ -48,7 +48,7 @@ clap = { version = "4.6.4", features = ["derive"] }
 serde_json = "1.0"
 # Time control for tests that would otherwise have to wait out real timeouts.
 # Dev-only, so the shipped binary keeps the narrowed feature set above.
-tokio = { version = "1.53.1", features = ["test-util"] }
+tokio = { version = "1.54.1", features = ["test-util"] }
 
 [profile.release]
 lto = true
