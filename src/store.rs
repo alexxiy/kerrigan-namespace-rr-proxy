@@ -256,7 +256,7 @@ mod tests {
 
     /// A record payload in the client wire format, plus the leaf hash it implies.
     fn record(domain: &str) -> (Vec<u8>, Hash) {
-        let rec = pins_core::LeafRecord {
+        let rec = kns_core::LeafRecord {
             domain: domain.to_string(),
             pubkey: [7u8; 32],
             target_address: "ps1abc".to_string(),
@@ -461,7 +461,7 @@ mod tests {
         let proof = smt.proof(&store, "alice.zec").unwrap();
         let (_, leaf) = record("alice.zec");
         let (reconstructed, _) =
-            pins_core::verify_and_apply("alice.zec", &proof, Some(leaf), [0xAAu8; 32]);
+            kns_core::verify_and_apply("alice.zec", &proof, Some(leaf), [0xAAu8; 32]);
         assert_eq!(reconstructed, root);
     }
 }

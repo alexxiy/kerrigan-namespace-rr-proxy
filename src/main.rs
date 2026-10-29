@@ -1,6 +1,6 @@
-//! # rr-proxy — PiNS RocksDB & Sparse Merkle Tree Daemon
+//! # rr-proxy — KNS RocksDB & Sparse Merkle Tree Daemon
 //!
-//! A Unix-socket daemon owning the Sparse Merkle Tree (SMT) behind the PiNS name
+//! A Unix-socket daemon owning the Sparse Merkle Tree (SMT) behind the KNS name
 //! service, exposed to clients that lack native, thread-safe, high-performance
 //! RocksDB bindings (notably PHP).
 //!
@@ -43,7 +43,7 @@ use store::{PendingBatch, RocksStore};
 // =====================================================================
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "PiNS RocksDB & SMT Daemon", long_about = None)]
+#[command(author, version, about = "KNS RocksDB & SMT Daemon", long_about = None)]
 struct Cli {
     /// Path to the configuration file
     #[arg(short, long)]

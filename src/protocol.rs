@@ -204,7 +204,7 @@ pub const TERMINAL_BLOCKED: u8 = 0x02;
 
 /// Encodes a record in the same layout clients send to `SMT_UPDATE`, so the two
 /// directions share one definition and `parse_record` is its exact inverse.
-pub fn encode_record(record: &pins_core::LeafRecord) -> Vec<u8> {
+pub fn encode_record(record: &kns_core::LeafRecord) -> Vec<u8> {
     let mut out = Vec::with_capacity(HASH_LEN + 20 + record.target_address.len() + record.domain.len());
     out.extend_from_slice(&record.pubkey);
     out.extend_from_slice(&record.price.to_be_bytes());
@@ -224,23 +224,23 @@ pub fn encode_record(record: &pins_core::LeafRecord) -> Vec<u8> {
 /// A `TERMINAL_BLOCKED` proof is followed by the blocking domain's full record, in
 /// the layout above. The whole preimage is carried rather than just its key because
 /// the circuit must derive the blocking key from the same bytes that produce the
-/// blocking leaf hash — see `pivx-name-prover/docs/compact-smt.md` §5.3.
+/// blocking leaf hash — see `kerrigan-name-prover/docs/compact-smt.md` §5.3.
 ///
 /// The payload is variable length now: clients must read `depth` and the terminal
 /// tag rather than assuming a fixed 128-sibling proof.
-pub fn encode_proof(root: &[u8; HASH_LEN], proof: &pins_core::Proof) -> Vec<u8> {
+pub fn encode_proof(root: &[u8; HASH_LEN], proof: &kns_core::Proof) -> Vec<u8> {
     let mut out = Vec::with_capacity(HASH_LEN * (2 + proof.siblings.len()));
     out.extend_from_slice(root);
     out.push(proof.depth);
     out.push(match &proof.terminal {
-        pins_core::Terminal::Occupied => TERMINAL_OCCUPIED,
-        pins_core::Terminal::Vacant => TERMINAL_VACANT,
-        pins_core::Terminal::Blocked { .. } => TERMINAL_BLOCKED,
+        kns_core::Terminal::Occupied => TERMINAL_OCCUPIED,
+        kns_core::Terminal::Vacant => TERMINAL_VACANT,
+        kns_core::Terminal::Blocked { .. } => TERMINAL_BLOCKED,
     });
     for sibling in &proof.siblings {
         out.extend_from_slice(sibling);
     }
-    if let pins_core::Terminal::Blocked { record } = &proof.terminal {
+    if let kns_core::Terminal::Blocked { record } = &proof.terminal {
         out.extend_from_slice(&encode_record(record));
     }
     out

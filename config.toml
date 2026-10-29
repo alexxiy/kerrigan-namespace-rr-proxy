@@ -2,13 +2,13 @@
 # the registrar's - each with its own socket and its own database. Copy this file per
 # instance; the paths below are the INDEXER instance, and must match
 # INDEXER_ROCKSDB_PROXY_SOCKET_PATH in the PHP client's config. The registrar instance
-# uses pivx-registrar.sock and its own db_path.
+# uses kerrigan-registrar.sock and its own db_path.
 #
-# The names are coin-specific on purpose: a ZCash Name deployment on the same host uses
-# zcash-*.sock, so nothing collides.
+# The names are coin-specific on purpose: PIVX Name and ZCash Name deployments on the same
+# host use pivx-*.sock and zcash-*.sock, so nothing collides.
 
 [server]
-socket_path = "/run/rr-proxy/pivx-indexer.sock"
+socket_path = "/run/rr-proxy/kerrigan-indexer.sock"
 # Restricted to the owning user and group. Widen only if a client runs as another
 # user, and prefer adding that user to the group instead.
 socket_perms = "0660"
@@ -16,12 +16,12 @@ socket_perms = "0660"
 [logging]
 # Optional. When unset, logs go to stdout (captured by journald under systemd).
 # The file is opened with O_APPEND, so logrotate's `copytruncate` is safe.
-log_file = "/opt/rr-proxy/logs/pivx-indexer.log"
+log_file = "/opt/rr-proxy/logs/kerrigan-indexer.log"
 # trace | debug | info | warn | error
 level = "info"
 
 [database]
-db_path = "/opt/rr-proxy/db/pivx_indexer_rocksdb"
+db_path = "/opt/rr-proxy/db/kerrigan_indexer_rocksdb"
 # Kept false so a mistyped path or an unmounted volume fails loudly instead of
 # silently creating an empty tree. Set true once, for first-run initialisation.
 create_if_missing = false

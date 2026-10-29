@@ -1,6 +1,6 @@
 [package]
-name = "pivx-name-rr-proxy"
-version = "0.2.1"
+name = "kerrigan-name-rr-proxy"
+version = "0.1.0"
 edition = "2024"
 
 [[bin]]
@@ -23,7 +23,7 @@ rocksdb = "0.25.0"
 # NOTE: a path dependency ties this build to the prover checkout sitting beside it.
 # For deployment, switch to a git dependency pinned to a tag so the daemon and the
 # on-chain vKey are provably built from the same protocol revision.
-pins-core = { path = "../pivx-name-prover/pins-core", default-features = false }
+kns-core = { path = "../kerrigan-name-prover/kns-core", default-features = false }
 # Only the runtime pieces this daemon actually uses.
 tokio = { version = "1.54.1", features = [
     "rt-multi-thread",

@@ -1,6 +1,6 @@
 //! Compact Sparse Merkle Tree over an opaque node store.
 //!
-//! This is the storage-side half of the tree that `pivx-name-prover` verifies
+//! This is the storage-side half of the tree that `kerrigan-name-prover` verifies
 //! on-chain. Moving traversal here removes the socket round trips per domain
 //! operation that a client-side implementation requires, and makes proof/root
 //! consistency structural rather than a matter of client discipline.
@@ -8,7 +8,7 @@
 //! ## One definition of the hash rules
 //!
 //! Leaf hashing, node hashing, path derivation and the verification algorithm are
-//! NOT defined here — they come from the `pins-core` crate, which the prover's guest
+//! NOT defined here — they come from the `kns-core` crate, which the prover's guest
 //! circuit uses too. That is what makes "the daemon and the prover agree" a
 //! compile-time property instead of a claim maintained by hand. This module owns
 //! only what is genuinely storage-side: node keys, the descent and the writes.
@@ -18,13 +18,13 @@
 //! The tree is compact: a leaf sits at the shallowest depth at which it is the only
 //! key in its subtree, so a proof carries ~log2(N) siblings rather than a fixed 128.
 //! An empty subtree is the single constant [`EMPTY`] at every height — there is no
-//! default-hash ladder. See `pivx-name-prover/docs/compact-smt.md`, which is the
+//! default-hash ladder. See `kerrigan-name-prover/docs/compact-smt.md`, which is the
 //! specification this implements.
 //!
 //! A domain's path is the first 128 bits of `sha256(domain)`, most-significant-bit
 //! first within each byte; path bit `0` selects the left child. That bit order looks
 //! different from the circuit's, but consumes the path identically; the
-//! `proof_verifies_under_the_provers_traversal` test pins it against `pins-core`
+//! `proof_verifies_under_the_provers_traversal` test pins it against `kns-core`
 //! directly rather than against a transcription.
 //!
 //! ## Storage
@@ -47,19 +47,19 @@
 //! blocking domain's **full preimage** — see spec §5.3, which explains why supplying
 //! only its key is exploitable.
 
-pub use pins_core::{EMPTY, MAX_DEPTH as DEPTH};
+pub use kns_core::{EMPTY, MAX_DEPTH as DEPTH};
 
-/// Leaf hash for a domain record. Re-exported from `pins-core`: clients send record
+/// Leaf hash for a domain record. Re-exported from `kns-core`: clients send record
 /// fields rather than a precomputed hash, so field order, endianness and the
 /// domain-separation tag have exactly one definition, shared with the prover.
-pub use pins_core::hash_leaf;
+pub use kns_core::hash_leaf;
 
-/// Internal node hash. Re-exported from `pins-core` — see [`hash_leaf`].
-pub use pins_core::hash_node as hash_pair;
+/// Internal node hash. Re-exported from `kns-core` — see [`hash_leaf`].
+pub use kns_core::hash_node as hash_pair;
 
-pub use pins_core::{Hash, LeafRecord, Proof, Terminal};
+pub use kns_core::{Hash, LeafRecord, Proof, Terminal};
 
-use pins_core::{first_divergence, key_bit, key_of};
+use kns_core::{first_divergence, key_bit, key_of};
 
 /// Largest encoded node key: one depth byte plus the packed path.
 pub const MAX_KEY_LEN: usize = 1 + DEPTH / 8;
@@ -417,7 +417,7 @@ impl Smt {
 
 /// The 128-bit tree path for a domain: `sha256(domain)[..16]`, MSB first.
 ///
-/// The key itself comes from [`pins_core::key_of`]; only the unpacking into per-level
+/// The key itself comes from [`kns_core::key_of`]; only the unpacking into per-level
 /// bits is local, because the storage layer indexes by depth while the circuit
 /// consumes the same bits in the opposite nesting order.
 pub fn path_bits(domain: &str) -> PathBits {
@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn path_is_msb_first_over_the_first_16_bytes() {
-        let key = pins_core::key_of("example.zec");
+        let key = kns_core::key_of("example.zec");
         let bits = path_bits("example.zec");
         assert_eq!(bits.len(), 128);
         assert_eq!(bits[0], (key[0] >> 7) & 1 == 1);
@@ -645,7 +645,7 @@ mod tests {
     // ---- cross-implementation agreement with the prover ----
 
     /// The contract that matters: a proof this daemon emits must reconstruct the
-    /// root under the CIRCUIT's verifier. This calls `pins-core` directly rather than
+    /// root under the CIRCUIT's verifier. This calls `kns-core` directly rather than
     /// a transcription, so it cannot drift.
     #[test]
     fn proof_verifies_under_the_provers_traversal() {
@@ -656,7 +656,7 @@ mod tests {
         let proof = smt.proof(&store, "alice.zec").unwrap();
         let leaf = make_record("alice.zec", 1).leaf();
         let (reconstructed, _) =
-            pins_core::verify_and_apply("alice.zec", &proof, Some(leaf), [0xAAu8; 32]);
+            kns_core::verify_and_apply("alice.zec", &proof, Some(leaf), [0xAAu8; 32]);
         assert_eq!(reconstructed, root);
     }
 
@@ -675,7 +675,7 @@ mod tests {
             let proof = smt.proof(&store, d).unwrap();
             assert_eq!(proof.terminal, Terminal::Occupied, "{d}");
             let (reconstructed, _) =
-                pins_core::verify_and_apply(d, &proof, Some(make_record(d, 1).leaf()), [0xAAu8; 32]);
+                kns_core::verify_and_apply(d, &proof, Some(make_record(d, 1).leaf()), [0xAAu8; 32]);
             assert_eq!(reconstructed, root, "proof for {d} failed under the circuit");
         }
     }
@@ -704,7 +704,7 @@ mod tests {
 
             let rec = make_record(&name, 1);
             let (old_root, circuit_new_root) =
-                pins_core::verify_and_apply(&name, &proof, None, rec.leaf());
+                kns_core::verify_and_apply(&name, &proof, None, rec.leaf());
             assert_eq!(old_root, root, "{name}: absence proof rejected by the circuit");
 
             root = put(&smt, &mut store, &name, 1);
@@ -868,7 +868,7 @@ mod php_vectors {
 /// The vectors are committed, so only the PHP artefact has to be produced:
 /// ```bash
 /// php resources/tools/smt_proof_crosscheck.php \
-///     ../pivx-name-rr-proxy/tests/fixtures/php_proof_vectors.json /tmp/php_output.json
+///     ../kerrigan-name-rr-proxy/tests/fixtures/php_proof_vectors.json /tmp/php_output.json
 /// PHP_OUTPUT=/tmp/php_output.json cargo test -- --ignored php_output_deserialises
 /// ```
 ///

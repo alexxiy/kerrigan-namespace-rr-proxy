@@ -466,7 +466,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
-name = "pins-core"
+name = "kns-core"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -474,11 +474,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "pivx-name-rr-proxy"
-version = "0.2.1"
+name = "kerrigan-name-rr-proxy"
+version = "0.1.0"
 dependencies = [
  "clap",
- "pins-core",
+ "kns-core",
  "rocksdb",
  "serde",
  "serde_json",

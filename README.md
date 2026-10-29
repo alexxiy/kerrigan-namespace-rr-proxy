@@ -1,8 +1,8 @@
-# PiNS RocksDB & Sparse Merkle Tree Daemon (`rr-proxy`)
+# KNS RocksDB & Sparse Merkle Tree Daemon (`rr-proxy`)
 
-A lightweight, high-performance Unix socket daemon written in Rust. It owns the **Sparse Merkle Tree (SMT)** behind the PiNS name service and exposes it to clients that lack native thread-safe or high-performance RocksDB bindings (such as PHP), over a binary protocol on a Unix domain socket.
+A lightweight, high-performance Unix socket daemon written in Rust. It owns the **Sparse Merkle Tree (SMT)** behind Kerrigan NameSpace (KNS) and exposes it to clients that lack native thread-safe or high-performance RocksDB bindings (such as PHP), over a binary protocol on a Unix domain socket.
 
-## SMT Handling in the PiNS Name Service
+## SMT Handling in Kerrigan NameSpace
 
 Sparse Merkle Trees generate cryptographic proofs and rewrite tree structure across many operations per block, so they need low-latency reads and writes. During a single update sequence, parent nodes must be read immediately after being written but before the batch is committed.
 
@@ -78,7 +78,7 @@ A proof is **variable length**: the compact tree carries only the siblings on th
 
 - `depth` is the number of siblings that follow (`0..=128`); siblings are **deepest first**.
 - `terminal` tags the leaf slot the path reached: `0x00` OCCUPIED, `0x01` VACANT, `0x02` BLOCKED.
-- A **BLOCKED** (`0x02`) proof is followed by the blocking domain's full **record** (the layout above). The whole preimage is sent, not just a key, because the circuit must derive the blocking key from the same bytes that produce its leaf hash (see `pivx-name-prover/docs/compact-smt.md` §5.3).
+- A **BLOCKED** (`0x02`) proof is followed by the blocking domain's full **record** (the layout above). The whole preimage is sent, not just a key, because the circuit must derive the blocking key from the same bytes that produce its leaf hash (see `kerrigan-name-prover/docs/compact-smt.md` §5.3).
 
 The leaf's own hash is never sent — the client recomputes it from the record and rehashes up through the siblings to check the root.
 
