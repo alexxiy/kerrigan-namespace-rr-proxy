@@ -1,0 +1,75 @@
+# Template for running several daemons on one host - the indexer's and the registrar's,
+# and those of other networks: rr-proxy@<name>.service reads /opt/rr-proxy/<name>.toml.
+# Identical to rr-proxy.service otherwise; keep the two in step.
+[Unit]
+Description=Rust RocksDB Proxy Daemon (rr-proxy), instance %i
+After=network.target
+
+[Service]
+Type=simple
+# Placeholders for the system user and group running the daemon.
+# Clients (indexer, registrar) must belong to {{GROUP}} to reach the 0660 socket.
+User={{USER}}
+Group={{GROUP}}
+
+# One configuration per instance: rr-proxy@kerrigan-indexer reads /opt/rr-proxy/kerrigan-indexer.toml.
+# Each config names its own socket, database and log file (see config.toml).
+ExecStart=/opt/rr-proxy/rr-proxy --config /opt/rr-proxy/%i.toml
+
+# Automatically creates /run/rr-proxy/ owned by User:Group
+# with the specified permissions. Every instance shares it, each with its own socket in
+# it, so RuntimeDirectoryPreserve=yes is required: without it, stopping one instance
+# would remove the directory, and the sockets of the others with it.
+RuntimeDirectory=rr-proxy
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+# Restart service if it crashes
+Restart=on-failure
+RestartSec=5s
+
+# On SIGTERM the daemon stops accepting, flushes RocksDB memtables and unlinks the
+# socket. Give it room to finish rather than being SIGKILLed mid-flush.
+TimeoutStopSec=60s
+
+# RocksDB is configured with max_open_files = 10000; without a matching limit it
+# will hit the inherited ceiling, and fd exhaustion degrades the accept loop.
+LimitNOFILE=65535
+
+# Security and sandboxing recommendations
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true
+# Both paths must be writable: the database, and the log file directory.
+# These must agree with database.db_path and logging.log_file in config.toml.
+ReadWritePaths=/opt/rr-proxy/db
+ReadWritePaths=/opt/rr-proxy/logs
+# Beyond its files and its Unix socket the daemon needs nothing: no capabilities, no
+# devices, no network, no home directories, no kernel or system state to change.
+CapabilityBoundingSet=
+ProtectHome=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# Nothing in it generates code at run time (RocksDB, tokio), so no memory is ever both
+# writable and executable.
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# The set systemd defines for a system service, without the calls that need privileges.
+# A call outside it fails with EPERM instead of killing the daemon: the operation that
+# needed it then fails with "Operation not permitted" in the daemon's log.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -5,7 +5,7 @@
 //! is committed. It doubles as the batch itself — the `WriteBatch` is built from
 //! it once, at commit time — so queued entries are held in memory only once.
 
-use crate::smt::{record_key, Hash, Node, NodeKey, NodeStore, EMPTY};
+use crate::smt::{record_key, Hash, Node, NodeKey, NodeStore, PathCollision, EMPTY};
 use rocksdb::{DB, SnapshotWithThreadMode, WriteBatch, WriteOptions};
 use std::collections::HashMap;
 use std::fmt;
@@ -37,6 +37,9 @@ pub enum StoreError {
     /// A stored node could not be decoded, which means on-disk corruption or a
     /// foreign writer — never a client mistake.
     CorruptNode { value_len: usize },
+    /// An update for a domain whose 128-bit key another domain already has in full;
+    /// nothing was written (see `PathCollision`).
+    PathCollision(PathCollision),
 }
 
 impl fmt::Display for StoreError {
@@ -46,6 +49,7 @@ impl fmt::Display for StoreError {
             StoreError::CorruptNode { value_len } => {
                 write!(f, "corrupt node: undecodable value of {value_len} bytes")
             }
+            StoreError::PathCollision(c) => write!(f, "path collision: {c}"),
         }
     }
 }
@@ -53,6 +57,12 @@ impl fmt::Display for StoreError {
 impl From<rocksdb::Error> for StoreError {
     fn from(e: rocksdb::Error) -> Self {
         StoreError::Db(e)
+    }
+}
+
+impl From<PathCollision> for StoreError {
+    fn from(c: PathCollision) -> Self {
+        StoreError::PathCollision(c)
     }
 }
 

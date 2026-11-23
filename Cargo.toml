@@ -1,6 +1,6 @@
 [package]
 name = "kerrigan-name-rr-proxy"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [[bin]]
@@ -20,10 +20,14 @@ rocksdb = "0.25.0"
 # (bech32) and signature (ed25519-dalek) stacks are the circuit's business and
 # are compiled out here.
 #
-# NOTE: a path dependency ties this build to the prover checkout sitting beside it.
-# For deployment, switch to a git dependency pinned to a tag so the daemon and the
-# on-chain vKey are provably built from the same protocol revision.
-kns-core = { path = "../kerrigan-name-prover/kns-core", default-features = false }
+# Pinned to the commit of the prover tag v0.1.0 (the circuit of the on-chain vKey), so the
+# daemon and the vKey are provably built from the same protocol revision, and a build
+# needs no prover checkout beside it. A commit rather than the tag: a tag can be moved.
+# Move it with the prover's releases. To build against a local prover checkout instead
+# (while changing kns-core), without editing this file:
+#   cargo build --config 'patch."https://github.com/alexxiy/kerrigan-namespace-prover".kns-core.path="../kerrigan-name-prover/kns-core"'
+# It drops kns-core's source from Cargo.lock: `git checkout Cargo.lock` before committing.
+kns-core = { git = "https://github.com/alexxiy/kerrigan-namespace-prover", rev = "301e650f2ff8a34eeca0f7429e199a0bafe8a5e2", default-features = false }
 # Only the runtime pieces this daemon actually uses.
 tokio = { version = "1.54.1", features = [
     "rt-multi-thread",
@@ -38,9 +42,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # For configuration parsing
 serde = { version = "1.0.229", features = ["derive"] }
-toml = "1.1.8"
+toml = "1.2.2"
 # CLI parser
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.9", features = ["derive"] }
 
 [dev-dependencies]
 # Used only to emit cross-check vectors for the PHP client (see the ignored

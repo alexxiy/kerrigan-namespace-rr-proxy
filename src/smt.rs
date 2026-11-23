@@ -186,6 +186,31 @@ pub trait NodeStore {
     fn put_record(&mut self, domain: &str, payload: &[u8]) -> Result<(), Self::Error>;
 }
 
+/// Two distinct domains whose keys agree on all 128 bits, so the tree has no slot for
+/// the second one.
+///
+/// By chance this is out of reach (about 2^-128 per pair), but a birthday search for
+/// such a pair costs about 2^64 hashes. The update that would need the slot is refused
+/// before it writes anything; the clients refuse such a registration before it reaches
+/// the tree, and the circuit cannot prove one either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathCollision {
+    /// The domain the update was for.
+    pub domain: String,
+    /// The domain whose leaf holds the whole path.
+    pub holder: String,
+}
+
+impl std::fmt::Display for PathCollision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} shares all 128 key bits with {}: the tree cannot hold both",
+            self.domain, self.holder
+        )
+    }
+}
+
 /// Where a key's path ends, and how deep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Landing {
@@ -283,17 +308,41 @@ impl Smt {
     /// Writes `record`'s leaf at `domain`'s position, splitting if another domain
     /// holds the slot, and rehashes the spine to the root.
     ///
-    /// Returns the new root.
+    /// Returns the new root, or a [`PathCollision`] (with nothing written) when another
+    /// domain's key equals this one's on all 128 bits.
     pub fn update<S: NodeStore>(
         &self,
         store: &mut S,
         domain: &str,
         record_payload: &[u8],
         leaf: Hash,
-    ) -> Result<Hash, S::Error> {
+    ) -> Result<Hash, S::Error>
+    where
+        S::Error: From<PathCollision>,
+    {
         let bits = path_bits(domain);
         let (depth, landing) = self.descend(store, &bits, domain)?;
         let siblings = self.siblings(store, &bits, depth)?;
+
+        // Where a blocked slot splits: the first bit at which the two keys differ. Found
+        // before anything is written, because two distinct domains *can* share all 128
+        // bits (see `PathCollision`), and then there is nowhere to split.
+        let split = match &landing {
+            Landing::Blocked {
+                domain: other_domain,
+                ..
+            } => match first_divergence(&key_of(domain), &key_of(other_domain), depth) {
+                Some(j) => Some(j),
+                None => {
+                    return Err(PathCollision {
+                        domain: domain.to_string(),
+                        holder: other_domain.clone(),
+                    }
+                    .into());
+                }
+            },
+            Landing::Occupied | Landing::Vacant => None,
+        };
 
         // Keyed by domain, so this survives any later split untouched.
         store.put_record(domain, record_payload)?;
@@ -317,10 +366,9 @@ impl Smt {
                 domain: other_domain,
                 hash: other_leaf,
             } => {
-                let key = key_of(domain);
-                let other_key = key_of(&other_domain);
-                let j = first_divergence(&key, &other_key, depth)
-                    .expect("two distinct domains cannot share all 128 key bits");
+                let Some(j) = split else {
+                    unreachable!("the split of a blocked slot is found above");
+                };
                 debug_assert!(j < DEPTH);
 
                 // The blocking leaf vacates this position.
@@ -445,7 +493,8 @@ mod tests {
     }
 
     impl NodeStore for MemStore {
-        type Error = std::convert::Infallible;
+        // Its own operations never fail; this is the one error `Smt::update` can add.
+        type Error = PathCollision;
 
         fn get_node(&self, key: &NodeKey) -> Result<Option<Node>, Self::Error> {
             Ok(self.nodes.get(key.as_slice()).cloned())
@@ -614,6 +663,44 @@ mod tests {
                 panic!("stale leaf for {domain} left at the vacated depth")
             }
         }
+    }
+
+    #[test]
+    fn a_full_path_collision_is_refused_and_writes_nothing() {
+        // Two real domains sharing all 128 key bits take ~2^64 hashes to find, so the
+        // store is forged into the same position instead: internals down the whole path
+        // of a.krgn and another domain's leaf at the bottom - a blocked slot with no bit
+        // left to split on. This used to panic.
+        let smt = Smt::new();
+        let mut store = MemStore::default();
+        let bits = path_bits("a.krgn");
+        for d in 0..DEPTH {
+            store
+                .nodes
+                .insert(NodeKey::at(&bits, d).as_slice().to_vec(), Node::Internal([1u8; 32]));
+        }
+        let holder = make_record("b.krgn", 1);
+        store.nodes.insert(
+            NodeKey::at(&bits, DEPTH).as_slice().to_vec(),
+            Node::Leaf {
+                hash: holder.leaf(),
+                domain: "b.krgn".to_string(),
+            },
+        );
+        let nodes_before = store.nodes.clone();
+
+        let rec = make_record("a.krgn", 1);
+        let payload = crate::protocol::encode_record(&rec);
+        let err = smt.update(&mut store, "a.krgn", &payload, rec.leaf()).unwrap_err();
+        assert_eq!(
+            err,
+            PathCollision {
+                domain: "a.krgn".to_string(),
+                holder: "b.krgn".to_string(),
+            }
+        );
+        assert_eq!(store.nodes, nodes_before, "no node may change");
+        assert!(store.records.is_empty(), "no record may be written");
     }
 
     #[test]

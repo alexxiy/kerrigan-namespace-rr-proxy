@@ -13,7 +13,8 @@ Group={{GROUP}}
 ExecStart=/opt/rr-proxy/rr-proxy --config /opt/rr-proxy/config.toml
 
 # Automatically creates /run/rr-proxy/ owned by User:Group
-# with the specified permissions, and removes it when the service stops.
+# with the specified permissions. RuntimeDirectoryPreserve=yes keeps it when the
+# service stops (the daemon unlinks its own socket).
 RuntimeDirectory=rr-proxy
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes
@@ -38,6 +39,32 @@ NoNewPrivileges=true
 # These must agree with database.db_path and logging.log_file in config.toml.
 ReadWritePaths=/opt/rr-proxy/db
 ReadWritePaths=/opt/rr-proxy/logs
+# Beyond its files and its Unix socket the daemon needs nothing: no capabilities, no
+# devices, no network, no home directories, no kernel or system state to change.
+CapabilityBoundingSet=
+ProtectHome=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# Nothing in it generates code at run time (RocksDB, tokio), so no memory is ever both
+# writable and executable.
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# The set systemd defines for a system service, without the calls that need privileges.
+# A call outside it fails with EPERM instead of killing the daemon: the operation that
+# needed it then fails with "Operation not permitted" in the daemon's log.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned so a release build is reproducible: the binary is what this compiler makes of
+# Cargo.lock (build_rr-proxy.sh builds with --locked and records `rustc --version`).
+# Move it to the newest stable release, never a beta or nightly.
+channel = "1.100.0"
+components = ["clippy"]

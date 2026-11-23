@@ -1,12 +1,20 @@
 # logrotate configuration for rr-proxy.
-# Install as /etc/logrotate.d/rr-proxy and replace {{USER}} / {{GROUP}}.
+# Install as /etc/logrotate.d/rr-proxy.
 #
 # `copytruncate` is used deliberately: the daemon holds its log file open for the
 # life of the process and has no reopen signal. Because the file is opened with
 # O_APPEND, writes always target the current end of file, so truncation is safe and
 # does not leave a sparse hole.
+#
+# No `create`: with copytruncate the file is never recreated (it is copied, then truncated in
+# place), so logrotate ignores it; the file keeps the owner and mode the daemon gave it.
+#
+# Every *.log in the directory: each instance logs to the file its own config names
+# (logging.log_file, e.g. kerrigan-indexer.log and kerrigan-registrar.log), and a policy naming one
+# file left the others to grow without bound. Rotated copies (*.log.1, *.log.2.gz) do not
+# match the pattern, so they are never rotated again.
 
-/opt/rr-proxy/logs/rr-proxy.log {
+/opt/rr-proxy/logs/*.log {
     daily
     rotate 14
     compress
@@ -14,5 +22,4 @@
     missingok
     notifempty
     copytruncate
-    create 0640 {{USER}} {{GROUP}}
 }

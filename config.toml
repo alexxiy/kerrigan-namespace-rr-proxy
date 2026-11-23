@@ -38,6 +38,9 @@ sync_on_commit = true
 # Caps daemon memory held by an open batch. The client receives BATCH_TOO_LARGE
 # past this point and should commit and continue.
 max_batch_entries = 1000000
+# Close a connection that sends nothing for this long, unless it has a batch open.
+# 0 never closes one. The PHP client connects again when it finds its idle one closed.
+idle_timeout_secs = 600
 # Concurrent client connections. Further connections are closed immediately
 # rather than left hanging.
 max_connections = 64

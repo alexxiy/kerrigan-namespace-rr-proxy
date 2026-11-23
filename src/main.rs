@@ -9,9 +9,11 @@
 //! the tree walk runs in native code, and a proof is served with its root
 //! from a single snapshot — so the two can never disagree.
 //!
-//! Batches are atomic and provide read-your-own-writes per connection, but the
-//! daemon does not isolate concurrent writers. Each tree (indexer, registrar)
-//! runs its own instance against its own database, with a single writer each.
+//! Batches are atomic and provide read-your-own-writes per connection. Writes are
+//! not isolated from each other, so only one connection writes at a time: while one
+//! has a batch open or a write running, another's writes are refused (`BUSY`); reads
+//! never wait. Each tree (indexer, registrar) runs its own instance against its own
+//! database, with a single writer each.
 //!
 //! See `src/protocol.rs` for the wire format and `src/smt.rs` for the tree.
 
@@ -28,11 +30,13 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tokio::sync::{Semaphore, broadcast};
+use tracing::{debug, error, info, warn};
 
 use protocol::*;
 use smt::{DEPTH, Smt};
@@ -102,6 +106,9 @@ struct TuningConfig {
     max_connections: Option<usize>,
     /// How long to wait for in-flight connections to finish on shutdown.
     shutdown_drain_secs: Option<u64>,
+    /// Close a connection that sends nothing for this long, unless it has a batch open
+    /// (a batch may wait on its client's slow work). `0` never closes one.
+    idle_timeout_secs: Option<u64>,
 }
 
 /// Per-connection settings, cheap to copy into each spawned task.
@@ -110,11 +117,16 @@ struct Settings {
     max_input_size: usize,
     sync_on_commit: bool,
     max_batch_entries: usize,
+    /// `None`: idle connections stay open.
+    idle_timeout: Option<Duration>,
 }
 
 /// Ceiling on concurrent connections; also the permit count used to drain them.
 const DEFAULT_MAX_CONNECTIONS: usize = 64;
 const DEFAULT_DRAIN_SECS: u64 = 15;
+/// Long enough for any client that pauses between requests; a client that finds its
+/// idle connection closed connects again (the PHP client does so outside a batch).
+const DEFAULT_IDLE_SECS: u64 = 600;
 
 /// Helper to load and parse the TOML configuration file
 fn load_config(path: &str) -> Config {
@@ -336,20 +348,114 @@ fn bind_socket(path: &Path, mode: u32) -> Result<UnixListener, String> {
 // 4. CLIENT CONNECTION & TRANSACTION LOOP
 // =====================================================================
 
-/// Nodes written per SMT update: the leaf plus one per level up to the root.
-/// Worst-case node writes for one update, used only to decide when a client's batch
+/// Entries written per SMT update: the record, the leaf, and one node per level up to
+/// the root.
+/// Worst-case writes for one update, used only to decide when a client's batch
 /// is too large. The compact tree normally touches ~log2(N) nodes, but a split can
 /// push two leaves down to the bit where their keys diverge, so the bound stays at
-/// the tree depth rather than the expected depth.
-const NODES_PER_UPDATE: usize = DEPTH + 1;
+/// the tree depth rather than the expected depth. At its worst the keys diverge at the
+/// last bit: the two leaves at depth `DEPTH`, the internals at every depth above them,
+/// and the record - `DEPTH + 3` (`Smt::update`; the slot the other leaf vacates is one
+/// of those internals).
+const NODES_PER_UPDATE: usize = DEPTH + 3;
+
+/// Whether a raw key lies in one of the tree's key spaces (`smt` module docs): a node,
+/// whose first byte is a depth (`0..=DEPTH`), or a record (`RECORD_PREFIX`). Those are
+/// written by SMT_UPDATE only. A raw PUT or DELETE there would change one node or record
+/// without the spine above it - a tree whose root no longer hashes its contents, and
+/// whose proofs then fail.
+fn in_tree_keyspace(key: &[u8]) -> bool {
+    matches!(key.first(), Some(&b) if usize::from(b) <= DEPTH || b == smt::RECORD_PREFIX)
+}
+
+/// The one connection allowed to write the database at a time.
+///
+/// Writes are not isolated from each other: two connections writing at once each
+/// rehash a spine from a state without the other's writes, and the last commit wins -
+/// the other's acknowledged update is lost, and its record left behind. The clients
+/// keep to one writer per database under their own locks; this makes the daemon refuse
+/// a second writer (`BUSY`) instead of relying on that. A connection holds it from
+/// `BATCH_START` to `BATCH_COMMIT`/`BATCH_ABORT`, or for the length of one write
+/// outside a batch, and loses it when it closes. Reads never take it.
+#[derive(Default)]
+struct WriterLock {
+    owner: Mutex<Option<u64>>,
+}
+
+impl WriterLock {
+    /// Takes the lock for connection `id`, or keeps it when `id` already holds it.
+    /// False while another connection holds it.
+    fn acquire(&self, id: u64) -> bool {
+        // Nothing panics while holding it, so a poisoned lock still holds a valid owner.
+        let mut owner = self.owner.lock().unwrap_or_else(|p| p.into_inner());
+        match *owner {
+            None => {
+                *owner = Some(id);
+                true
+            }
+            Some(holder) => holder == id,
+        }
+    }
+
+    /// Gives the lock up if connection `id` holds it.
+    fn release(&self, id: u64) {
+        let mut owner = self.owner.lock().unwrap_or_else(|p| p.into_inner());
+        if *owner == Some(id) {
+            *owner = None;
+        }
+    }
+}
+
+/// Gives a connection's writer lock up however its task ends: a return, a client
+/// that went away, a shutdown.
+struct WriterRelease<'a> {
+    lock: &'a WriterLock,
+    id: u64,
+}
+
+impl Drop for WriterRelease<'_> {
+    fn drop(&mut self) {
+        self.lock.release(self.id);
+    }
+}
+
+/// Source of connection ids for the writer lock.
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// What every connection to one database shares.
+#[derive(Clone)]
+struct Shared {
+    db: Arc<DB>,
+    tree: Arc<Smt>,
+    writers: Arc<WriterLock>,
+    settings: Settings,
+}
+
+/// Resolves once a connection has been idle for `limit`; never, without one.
+async fn idle_expiry(limit: Option<Duration>) {
+    match limit {
+        Some(limit) => tokio::time::sleep(limit).await,
+        None => std::future::pending::<()>().await,
+    }
+}
 
 async fn handle_connection(
     mut socket: UnixStream,
-    db: Arc<DB>,
-    tree: Arc<Smt>,
-    settings: Settings,
+    shared: Shared,
     mut shutdown: broadcast::Receiver<()>,
 ) {
+    let Shared {
+        db,
+        tree,
+        writers,
+        settings,
+    } = shared;
+    let id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    let _release = WriterRelease {
+        lock: &writers,
+        id,
+    };
+
     let (reader, writer) = socket.split();
     let mut reader = BufReader::new(reader);
     // Buffered so a response header and its payload leave as a single syscall.
@@ -357,6 +463,12 @@ async fn handle_connection(
 
     let mut batch: PendingBatch = HashMap::new();
     let mut in_batch = false;
+    // Set when the open batch lost its overlay (a failed SMT_UPDATE, a panicked task): it
+    // holds none of the writes the client queued, so it stays open, refusing every command
+    // but PING, STATS and BATCH_ABORT, until the client aborts it. Closing it instead let a
+    // client that carried on past the error have each later write committed on its own,
+    // and only learn of it at BATCH_COMMIT ("no batch is open").
+    let mut batch_failed = false;
     let mut payload = Vec::with_capacity(1024);
 
     /// Writes a response; evaluates to `return` on a broken pipe so a dead
@@ -365,6 +477,17 @@ async fn handle_connection(
         ($status:expr, $body:expr) => {
             if write_response(&mut writer, $status, $body).await.is_err() {
                 return;
+            }
+        };
+    }
+
+    /// Takes the writer lock for a write (see `WriterLock`), or answers `BUSY` and
+    /// moves on to the next request. Inside a batch this connection holds it already.
+    macro_rules! claim_writer {
+        () => {
+            if !writers.acquire(id) {
+                respond!(ST_BUSY, b"another connection is writing");
+                continue;
             }
         };
     }
@@ -401,7 +524,9 @@ async fn handle_connection(
                 }
                 Err(e) => {
                     error!("blocking task panicked: {}", e);
-                    in_batch = false;
+                    // Outside a batch there was nothing to lose; inside one, the overlay
+                    // went with the task (see `batch_failed`).
+                    batch_failed = in_batch;
                     respond!(ST_ERROR, b"internal error");
                     None
                 }
@@ -410,6 +535,12 @@ async fn handle_connection(
     }
 
     loop {
+        // A write outside a batch held the writer lock for that one request only; a
+        // batch holds it until it is committed or aborted.
+        if !in_batch {
+            writers.release(id);
+        }
+
         // Only the wait for the *next* request is cancellable. A request already
         // read is processed to completion, so shutdown never truncates work in
         // progress — it just stops us accepting more of it.
@@ -424,12 +555,24 @@ async fn handle_connection(
                     return;
                 }
             },
+            // Never inside a batch: its client may be waiting on slow work of its own.
+            () = idle_expiry(if in_batch { None } else { settings.idle_timeout }) => {
+                debug!("closing an idle connection");
+                return;
+            }
         };
 
         // Release the allocation after an unusually large frame rather than
         // pinning it for the lifetime of the connection.
         if payload.capacity() > 64 * 1024 {
             payload.shrink_to(8192);
+        }
+
+        // A failed batch (see `batch_failed`): a write would be queued after writes that are
+        // gone, and a read would answer from the committed state, which is not the batch's.
+        if batch_failed && !matches!(opcode, OP_PING | OP_STATS | OP_BATCH_ABORT) {
+            respond!(ST_ERROR, b"the batch failed: abort it");
+            continue;
         }
 
         match opcode {
@@ -475,10 +618,15 @@ async fn handle_connection(
                     respond!(ST_BAD_COMMAND, b"expected [u32 keylen][key][value]");
                     continue;
                 };
+                if in_tree_keyspace(&key) {
+                    respond!(ST_BAD_COMMAND, b"a key of the tree: written by SMT_UPDATE only");
+                    continue;
+                }
                 if in_batch && batch.len() >= settings.max_batch_entries {
                     respond!(ST_BATCH_TOO_LARGE, b"");
                     continue;
                 }
+                claim_writer!();
                 let queued = in_batch;
                 let Some(outcome) = with_store!(
                     false,
@@ -497,10 +645,15 @@ async fn handle_connection(
 
             OP_DELETE => {
                 let key = payload.clone();
+                if in_tree_keyspace(&key) {
+                    respond!(ST_BAD_COMMAND, b"a key of the tree: written by SMT_UPDATE only");
+                    continue;
+                }
                 if in_batch && batch.len() >= settings.max_batch_entries {
                     respond!(ST_BATCH_TOO_LARGE, b"");
                     continue;
                 }
+                claim_writer!();
                 let queued = in_batch;
                 let Some(outcome) = with_store!(
                     false,
@@ -583,6 +736,7 @@ async fn handle_connection(
                     respond!(ST_BATCH_TOO_LARGE, b"");
                     continue;
                 }
+                claim_writer!();
                 // An update rewrites the whole spine. Those writes always go
                 // through an overlay so they land as one atomic batch — writing
                 // them individually would leave the tree structurally corrupt if
@@ -622,16 +776,17 @@ async fn handle_connection(
                         respond!(ST_OK, &root);
                     }
                     Ok((_, Err(e))) => {
-                        // The batch is now indeterminate, so close it: a later
+                        // The batch is now indeterminate, so it is failed: a later
                         // BATCH_COMMIT is refused instead of persisting a
-                        // partially rewritten spine.
+                        // partially rewritten spine, and so is every write until the
+                        // client aborts it (see `batch_failed`).
                         error!("smt update failed: {}", e);
-                        in_batch = false;
+                        batch_failed = in_batch;
                         respond!(ST_ERROR, e.to_string().as_bytes());
                     }
                     Err(e) => {
                         error!("update task panicked: {}", e);
-                        in_batch = false;
+                        batch_failed = in_batch;
                         respond!(ST_ERROR, b"internal error");
                     }
                 }
@@ -702,6 +857,41 @@ async fn handle_connection(
                 }
             }
 
+            // Proofs of several domains and their one root, all from one snapshot:
+            // a list of names answered together is proved against one state of the
+            // tree, in one round trip and one blocking task instead of one each.
+            OP_SMT_PROOFS => {
+                let Some(domains) = parse_domains(&payload, MAX_PROOFS_PER_REQUEST) else {
+                    respond!(
+                        ST_BAD_COMMAND,
+                        b"expected 1 to 1000 length-prefixed non-empty utf-8 domains"
+                    );
+                    continue;
+                };
+                let Some(outcome) = with_store!(
+                    true,
+                    move |t: &Smt, s: &mut RocksStore<'_>| {
+                        let root = t.root(s)?;
+                        let mut proofs = Vec::with_capacity(domains.len());
+                        for domain in &domains {
+                            proofs.push(t.proof(s, domain)?);
+                        }
+                        Ok::<_, store::StoreError>((root, proofs))
+                    }
+                ) else {
+                    continue;
+                };
+                match outcome {
+                    Ok((root, proofs)) => {
+                        respond!(ST_OK, &protocol::encode_proofs(&root, &proofs));
+                    }
+                    Err(e) => {
+                        error!("smt proofs failed: {}", e);
+                        respond!(ST_ERROR, e.to_string().as_bytes());
+                    }
+                }
+            }
+
             // ---------------------------------------------------------
             OP_BATCH_START => {
                 // Silently resetting an open batch would discard the client's
@@ -711,6 +901,7 @@ async fn handle_connection(
                     respond!(ST_ALREADY_IN_BATCH, b"");
                     continue;
                 }
+                claim_writer!();
                 in_batch = true;
                 batch.clear();
                 respond!(ST_OK, b"");
@@ -756,6 +947,7 @@ async fn handle_connection(
                 }
                 batch.clear();
                 in_batch = false;
+                batch_failed = false;
                 info!("batch aborted by client");
                 respond!(ST_OK, b"");
             }
@@ -769,6 +961,9 @@ async fn handle_connection(
                     respond!(ST_BAD_COMMAND, b"a batch is open");
                     continue;
                 }
+                // Wiping under another connection's open batch would leave that batch's
+                // spines over a tree that is gone.
+                claim_writer!();
 
                 warn!("CLEAR requested — wiping the database");
                 let db2 = Arc::clone(&db);
@@ -799,6 +994,66 @@ async fn handle_connection(
             }
         }
     }
+}
+
+/// Accepts connections until `shutdown` fires, each on its own task holding one of
+/// `connections`' permits. One past the limit is closed at once.
+///
+/// Returning drops the listener, so nothing more is accepted while the connections
+/// already open drain (see `drain`).
+async fn serve(
+    listener: UnixListener,
+    shared: Shared,
+    connections: Arc<Semaphore>,
+    limit: usize,
+    mut shutdown: broadcast::Receiver<()>,
+    conn_tx: broadcast::Sender<()>,
+) {
+    loop {
+        // Subscribed before the accept, not once it returns: a receiver sees only what is
+        // sent after it exists, so one made after a shutdown signal sent in between would
+        // never see it, and its connection would hold the drain below until it timed out.
+        let conn_shutdown = conn_tx.subscribe();
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((socket, _)) => {
+                        let permit = match Arc::clone(&connections).try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                // Dropping the socket closes it, so the client
+                                // sees a refusal rather than an indefinite hang.
+                                warn!(limit, "connection limit reached; rejecting");
+                                continue;
+                            }
+                        };
+                        let shared = shared.clone();
+                        tokio::spawn(async move {
+                            handle_connection(socket, shared, conn_shutdown).await;
+                            drop(permit);
+                        });
+                    }
+                    Err(e) => {
+                        // Back off: a persistent error such as EMFILE would otherwise
+                        // spin this loop at full speed and flood the log.
+                        error!("Socket accept error: {}", e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Waits up to `within` for every connection's permit to come back - for every
+/// connection task to have finished. True if they all did.
+async fn drain(connections: &Semaphore, limit: usize, within: Duration) -> bool {
+    // `validate_config` caps the limit at 65536, so it fits.
+    let permits = u32::try_from(limit).unwrap_or(u32::MAX);
+    tokio::time::timeout(within, connections.acquire_many(permits))
+        .await
+        .is_ok()
 }
 
 // =====================================================================
@@ -865,16 +1120,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         socket_mode
     );
 
+    let idle_secs = config
+        .tuning
+        .idle_timeout_secs
+        .unwrap_or(DEFAULT_IDLE_SECS);
     let settings = Settings {
         max_input_size: config.tuning.max_input_size,
         sync_on_commit: config.tuning.sync_on_commit.unwrap_or(true),
         max_batch_entries: config.tuning.max_batch_entries.unwrap_or(1_000_000),
+        idle_timeout: (idle_secs > 0).then(|| Duration::from_secs(idle_secs)),
+    };
+    let shared = Shared {
+        db: Arc::clone(&db),
+        tree,
+        writers: Arc::new(WriterLock::default()),
+        settings,
     };
 
     // ---- Graceful shutdown ----
     // Signals break the accept loop so that main returns normally, running
     // destructors and flushing RocksDB rather than exiting mid-flight.
-    let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
     let conn_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         let mut sigterm = match signal(SignalKind::terminate()) {
@@ -905,42 +1171,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tuning
         .max_connections
         .unwrap_or(DEFAULT_MAX_CONNECTIONS);
-    let connections = Arc::new(tokio::sync::Semaphore::new(max_connections));
+    let connections = Arc::new(Semaphore::new(max_connections));
 
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.recv() => break,
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok((socket, _)) => {
-                        let permit = match Arc::clone(&connections).try_acquire_owned() {
-                            Ok(p) => p,
-                            Err(_) => {
-                                // Dropping the socket closes it, so the client
-                                // sees a refusal rather than an indefinite hang.
-                                warn!(limit = max_connections, "connection limit reached; rejecting");
-                                continue;
-                            }
-                        };
-                        let db_clone = Arc::clone(&db);
-                        let tree_clone = Arc::clone(&tree);
-                        let conn_shutdown = conn_tx.subscribe();
-                        tokio::spawn(async move {
-                            handle_connection(socket, db_clone, tree_clone, settings, conn_shutdown)
-                                .await;
-                            drop(permit);
-                        });
-                    }
-                    Err(e) => {
-                        // Back off: a persistent error such as EMFILE would otherwise
-                        // spin this loop at full speed and flood the log.
-                        error!("Socket accept error: {}", e);
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        }
-    }
+    serve(
+        listener,
+        shared,
+        Arc::clone(&connections),
+        max_connections,
+        shutdown_rx,
+        conn_tx,
+    )
+    .await;
 
     // ---- Clean shutdown ----
     // Connections were signalled by the same broadcast that broke the accept
@@ -951,20 +1192,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .shutdown_drain_secs
         .unwrap_or(DEFAULT_DRAIN_SECS);
     info!(drain_secs, "Draining client connections...");
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(drain_secs),
-        connections.acquire_many(max_connections as u32),
-    )
-    .await
-    {
-        Ok(_) => info!("All connections closed."),
-        Err(_) => warn!("Drain timed out; closing with connections still open."),
+    if drain(&connections, max_connections, Duration::from_secs(drain_secs)).await {
+        info!("All connections closed.");
+    } else {
+        warn!("Drain timed out; closing with connections still open.");
     }
 
     info!("Flushing RocksDB...");
     let db_flush = Arc::clone(&db);
-    if let Err(e) = tokio::task::spawn_blocking(move || db_flush.flush()).await {
-        error!("flush task panicked: {}", e);
+    match tokio::task::spawn_blocking(move || db_flush.flush()).await {
+        Ok(Ok(())) => {}
+        // Not fatal: what was committed is in the WAL, replayed at the next open.
+        Ok(Err(e)) => error!("RocksDB flush failed: {}", e),
+        Err(e) => error!("flush task panicked: {}", e),
     }
 
     match remove_stale_socket(socket_path) {
@@ -982,7 +1222,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // =====================================================================
 //
 // Wire-format tests live in `protocol.rs`, tree tests in `smt.rs`, and storage
-// tests in `store.rs`. What remains here is configuration handling.
+// tests in `store.rs`. What remains here is configuration handling, and in
+// `connection_tests` what a client sees of the connection loop.
 
 #[cfg(test)]
 mod tests {
@@ -1009,6 +1250,7 @@ mod tests {
                 max_batch_entries: None,
                 max_connections: None,
                 shutdown_drain_secs: None,
+                idle_timeout_secs: None,
             },
         }
     }
@@ -1051,5 +1293,529 @@ mod tests {
         let mut c = sample_config(1024, "0660");
         c.tuning.max_connections = Some(0);
         assert!(validate_config(&c).is_err());
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn settings(max_batch_entries: usize) -> Settings {
+        Settings {
+            max_input_size: 1 << 20,
+            sync_on_commit: false,
+            max_batch_entries,
+            idle_timeout: None,
+        }
+    }
+
+    /// A client of `handle_connection` over a socket pair, with its own database in a
+    /// temporary directory, removed when the client that made it is dropped.
+    struct Client {
+        stream: UnixStream,
+        db: Arc<DB>,
+        shared: Shared,
+        /// `None` on a second connection (`another`): the first one owns the directory.
+        path: Option<std::path::PathBuf>,
+        // Held so the connection is never told to shut down.
+        _shutdown: broadcast::Sender<()>,
+    }
+
+    impl Client {
+        fn start(tag: &str) -> Client {
+            Client::start_with(tag, settings(10_000))
+        }
+
+        fn start_with(tag: &str, settings: Settings) -> Client {
+            let path = std::env::temp_dir().join(format!("rr-proxy-conn-{}-{}", tag, std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            let db = Arc::new(DB::open_default(&path).unwrap());
+            let shared = Shared {
+                db: Arc::clone(&db),
+                tree: Arc::new(Smt::new()),
+                writers: Arc::new(WriterLock::default()),
+                settings,
+            };
+            Client::connect(shared, Some(path))
+        }
+
+        /// A second connection to the same database (and writer lock).
+        fn another(&self) -> Client {
+            Client::connect(self.shared.clone(), None)
+        }
+
+        fn connect(shared: Shared, path: Option<std::path::PathBuf>) -> Client {
+            let (stream, server) = UnixStream::pair().unwrap();
+            let (tx, rx) = broadcast::channel(1);
+            tokio::spawn(handle_connection(server, shared.clone(), rx));
+            Client { stream, db: Arc::clone(&shared.db), shared, path, _shutdown: tx }
+        }
+
+        async fn call(&mut self, op: u8, payload: &[u8]) -> (u8, Vec<u8>) {
+            let mut frame = vec![op];
+            frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            frame.extend_from_slice(payload);
+            self.stream.write_all(&frame).await.unwrap();
+            let mut head = [0u8; 5];
+            self.stream.read_exact(&mut head).await.unwrap();
+            let mut body = vec![0u8; u32::from_be_bytes(head[1..].try_into().unwrap()) as usize];
+            self.stream.read_exact(&mut body).await.unwrap();
+            (head[0], body)
+        }
+
+        async fn status(&mut self, op: u8, payload: &[u8]) -> u8 {
+            self.call(op, payload).await.0
+        }
+    }
+
+    impl Drop for Client {
+        fn drop(&mut self) {
+            if let Some(path) = &self.path {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+
+    fn record(domain: &str) -> Vec<u8> {
+        record_with_nonce(domain, 1)
+    }
+
+    fn record_with_nonce(domain: &str, nonce: u64) -> Vec<u8> {
+        protocol::encode_record(&kns_core::LeafRecord {
+            domain: domain.to_string(),
+            pubkey: [7u8; 32],
+            target_address: "ps1abc".to_string(),
+            price: 0,
+            nonce,
+        })
+    }
+
+    fn put(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut p = (key.len() as u32).to_be_bytes().to_vec();
+        p.extend_from_slice(key);
+        p.extend_from_slice(value);
+        p
+    }
+
+    /// An SMT_UPDATE that fails inside a batch leaves the batch open but failed: nothing
+    /// the client sends after it is written, read or committed until it aborts.
+    #[tokio::test]
+    async fn a_failed_update_fails_the_batch_until_it_is_aborted() {
+        let mut c = Client::start("failed-batch");
+        // A root node that does not decode: every update fails on it.
+        c.db.put([0u8], b"junk").unwrap();
+
+        assert_eq!(c.status(OP_BATCH_START, b"").await, ST_OK);
+        assert_eq!(c.status(OP_PUT, &put(b"\x90queued", b"1")).await, ST_QUEUED);
+        let (st, body) = c.call(OP_SMT_UPDATE, &record("a.krgn")).await;
+        assert_eq!(st, ST_ERROR, "{}", String::from_utf8_lossy(&body));
+
+        let failed: &[u8] = b"the batch failed: abort it";
+        for (op, payload) in [
+            (OP_SMT_UPDATE, record("b.krgn")),
+            (OP_PUT, put(b"\x90later", b"2")),
+            (OP_DELETE, b"\x90queued".to_vec()),
+            (OP_GET, b"\x90queued".to_vec()),
+            (OP_SMT_ROOT, Vec::new()),
+            (OP_SMT_LEAF, b"a.krgn".to_vec()),
+            (OP_BATCH_START, Vec::new()),
+            (OP_CLEAR, Vec::new()),
+            (OP_BATCH_COMMIT, Vec::new()),
+        ] {
+            assert_eq!(c.call(op, &payload).await, (ST_ERROR, failed.to_vec()), "opcode 0x{op:02x}");
+        }
+        assert_eq!(c.status(OP_PING, b"").await, ST_OK);
+        assert_eq!(c.status(OP_STATS, b"").await, ST_OK);
+
+        assert_eq!(c.status(OP_BATCH_ABORT, b"").await, ST_OK);
+        // Nothing of it was written.
+        assert_eq!(c.status(OP_GET, b"\x90queued").await, ST_NOT_FOUND);
+        assert_eq!(c.status(OP_GET, b"\x90later").await, ST_NOT_FOUND);
+        assert!(c.db.get(b"\x90queued").unwrap().is_none());
+
+        // Outside a batch the same failure leaves nothing behind to refuse.
+        assert_eq!(c.status(OP_SMT_UPDATE, &record("a.krgn")).await, ST_ERROR);
+        assert_eq!(c.status(OP_PUT, &put(b"\x90alone", b"3")).await, ST_OK);
+        assert_eq!(c.status(OP_GET, b"\x90alone").await, ST_OK);
+        // And a new batch works as ever.
+        assert_eq!(c.status(OP_BATCH_START, b"").await, ST_OK);
+        assert_eq!(c.status(OP_PUT, &put(b"\x90next", b"4")).await, ST_QUEUED);
+        assert_eq!(c.status(OP_BATCH_COMMIT, b"").await, ST_OK);
+        assert_eq!(c.db.get(b"\x90next").unwrap().as_deref(), Some(&b"4"[..]));
+    }
+
+    /// Raw PUT and DELETE are refused in the tree's key spaces, and only there; GET reads
+    /// anything. A refusal inside a batch leaves the batch as it was.
+    #[tokio::test]
+    async fn raw_writes_stay_out_of_the_tree() {
+        let mut c = Client::start("raw-keys");
+        assert_eq!(c.status(OP_SMT_UPDATE, &record("a.krgn")).await, ST_OK);
+        let root_before = c.call(OP_SMT_ROOT, b"").await.1;
+
+        let refused: &[u8] = b"a key of the tree: written by SMT_UPDATE only";
+        let depth_max = u8::try_from(DEPTH).unwrap();
+        let record_key = smt::record_key("a.krgn");
+        for key in [&[0u8][..], &[1, 0x80], &[depth_max, 0xff], &record_key[..], &[smt::RECORD_PREFIX]] {
+            assert_eq!(c.call(OP_PUT, &put(key, b"junk")).await, (ST_BAD_COMMAND, refused.to_vec()), "PUT {key:02x?}");
+            assert_eq!(c.call(OP_DELETE, key).await, (ST_BAD_COMMAND, refused.to_vec()), "DELETE {key:02x?}");
+        }
+        assert_eq!(c.status(OP_GET, &[0u8]).await, ST_OK, "the root node reads");
+        assert_eq!(c.status(OP_GET, &record_key).await, ST_OK, "a record reads");
+        assert_eq!(c.call(OP_SMT_ROOT, b"").await.1, root_before);
+
+        // Just past the node depths, below the record prefix, and the empty key: not the tree's.
+        for key in [&[depth_max + 1][..], &[depth_max + 1, 1, 2], &[smt::RECORD_PREFIX - 1], &[]] {
+            assert_eq!(c.status(OP_PUT, &put(key, b"v")).await, ST_OK, "PUT {key:02x?}");
+            assert_eq!(c.status(OP_DELETE, key).await, ST_OK, "DELETE {key:02x?}");
+        }
+
+        assert_eq!(c.status(OP_BATCH_START, b"").await, ST_OK);
+        assert_eq!(c.status(OP_PUT, &put(&[0u8], b"junk")).await, ST_BAD_COMMAND);
+        assert_eq!(c.status(OP_SMT_UPDATE, &record("b.krgn")).await, ST_OK);
+        assert_eq!(c.status(OP_BATCH_COMMIT, b"").await, ST_OK);
+        assert_eq!(c.status(OP_SMT_LEAF, b"b.krgn").await, ST_OK);
+    }
+
+    /// An SMT_PROOFS payload: `[u32 length][domain]` per domain.
+    fn domains(names: &[&[u8]]) -> Vec<u8> {
+        let mut p = Vec::new();
+        for name in names {
+            p.extend_from_slice(&(name.len() as u32).to_be_bytes());
+            p.extend_from_slice(name);
+        }
+        p
+    }
+
+    /// SMT_PROOFS refuses every malformed list, answers up to MAX_PROOFS_PER_REQUEST, and
+    /// inside a batch reads the batch.
+    #[tokio::test]
+    async fn smt_proofs_edges() {
+        let mut c = Client::start("proofs");
+        let many = |n: usize| {
+            let names: Vec<String> = (0..n).map(|i| format!("n{i}.krgn")).collect();
+            domains(&names.iter().map(|s| s.as_bytes()).collect::<Vec<_>>())
+        };
+        let mut past_the_end = domains(&[b"a.krgn"]);
+        past_the_end.pop();
+        for (name, payload) in [
+            ("an empty payload", Vec::new()),
+            ("an empty domain", domains(&[b""])),
+            ("a short length", vec![0, 0, 1]),
+            ("a length past the end", past_the_end),
+            ("a domain not utf-8", domains(&[&[0xff, 0xfe]])),
+            ("one domain too many", many(MAX_PROOFS_PER_REQUEST + 1)),
+        ] {
+            assert_eq!(c.status(OP_SMT_PROOFS, &payload).await, ST_BAD_COMMAND, "{name}");
+        }
+        let (st, body) = c.call(OP_SMT_PROOFS, &many(MAX_PROOFS_PER_REQUEST)).await;
+        assert_eq!(st, ST_OK);
+        // [root][u32 count]...
+        let count = u32::from_be_bytes(body[HASH_LEN..HASH_LEN + 4].try_into().unwrap());
+        assert_eq!(count as usize, MAX_PROOFS_PER_REQUEST);
+
+        let empty_root = c.call(OP_SMT_ROOT, b"").await.1;
+        assert_eq!(c.status(OP_BATCH_START, b"").await, ST_OK);
+        let (_, root) = c.call(OP_SMT_UPDATE, &record("x.krgn")).await;
+        let (st, body) = c.call(OP_SMT_PROOFS, &domains(&[b"x.krgn", b"y.krgn"])).await;
+        assert_eq!(st, ST_OK);
+        assert_eq!(&body[..HASH_LEN], &root[..], "the proofs are against the batch's root");
+        assert_eq!(c.call(OP_SMT_ROOT, b"").await.1, root, "and so is SMT_ROOT");
+        assert_eq!(c.status(OP_BATCH_ABORT, b"").await, ST_OK);
+        assert_eq!(c.call(OP_SMT_ROOT, b"").await.1, empty_root, "an abort drops the batch");
+    }
+
+    /// The answers the PHP client (`RustRocksDBProxy`) relies on.
+    #[tokio::test]
+    async fn contract_with_the_php_client() {
+        let mut c = Client::start("contract");
+        // smtProofs() falls back to SMT_PROOF on exactly this answer from an older daemon.
+        assert_eq!(c.call(OP_SMT_PROOFS + 1, b"").await, (ST_BAD_COMMAND, b"unknown opcode".to_vec()));
+        assert_eq!(c.status(OP_BATCH_COMMIT, b"").await, ST_BAD_COMMAND);
+        assert_eq!(c.status(OP_BATCH_ABORT, b"").await, ST_BAD_COMMAND);
+        assert_eq!(c.status(OP_BATCH_START, b"").await, ST_OK);
+        assert_eq!(c.status(OP_BATCH_START, b"").await, ST_ALREADY_IN_BATCH);
+        assert_eq!(c.status(OP_CLEAR, b"").await, ST_BAD_COMMAND);
+        // A malformed command inside a batch leaves the batch open and working.
+        assert_eq!(c.status(OP_SMT_UPDATE, b"short").await, ST_BAD_COMMAND);
+        assert_eq!(c.status(OP_SMT_UPDATE, &record("a.krgn")).await, ST_OK);
+        assert_eq!(c.status(OP_BATCH_COMMIT, b"").await, ST_OK);
+        assert_eq!(c.status(OP_SMT_LEAF, b"a.krgn").await, ST_OK);
+        assert_eq!(c.status(OP_SMT_LEAF, b"").await, ST_BAD_COMMAND);
+    }
+
+    /// SMT_VERIFY: a match, every kind of mismatch, an absent domain, a malformed record,
+    /// and inside a batch the batch's state.
+    #[tokio::test]
+    async fn smt_verify_answers() {
+        let mut c = Client::start("verify");
+        assert_eq!(c.status(OP_SMT_UPDATE, &record_with_nonce("a.krgn", 1)).await, ST_OK);
+        assert_eq!(c.status(OP_SMT_VERIFY, &record_with_nonce("a.krgn", 1)).await, ST_OK, "match");
+        assert_eq!(c.status(OP_SMT_VERIFY, &record_with_nonce("a.krgn", 2)).await, ST_NOT_FOUND, "nonce");
+        assert_eq!(c.status(OP_SMT_VERIFY, &record_with_nonce("b.krgn", 1)).await, ST_NOT_FOUND, "absent");
+        assert_eq!(c.status(OP_SMT_VERIFY, b"short").await, ST_BAD_COMMAND, "malformed");
+        assert_eq!(c.status(OP_SMT_VERIFY, b"").await, ST_BAD_COMMAND, "empty");
+        let stored = kns_core::LeafRecord {
+            domain: "a.krgn".into(),
+            pubkey: [7u8; 32],
+            target_address: "ps1abc".into(),
+            price: 0,
+            nonce: 1,
+        };
+        for (what, other) in [
+            ("pubkey", kns_core::LeafRecord { pubkey: [8u8; 32], ..stored.clone() }),
+            ("address", kns_core::LeafRecord { target_address: "ps1abd".into(), ..stored.clone() }),
+            ("price", kns_core::LeafRecord { price: 1, ..stored.clone() }),
+        ] {
+            assert_eq!(c.status(OP_SMT_VERIFY, &protocol::encode_record(&other)).await, ST_NOT_FOUND, "{what}");
+        }
+
+        assert_eq!(c.status(OP_BATCH_START, b"").await, ST_OK);
+        assert_eq!(c.status(OP_SMT_UPDATE, &record_with_nonce("c.krgn", 5)).await, ST_OK);
+        assert_eq!(c.status(OP_SMT_UPDATE, &record_with_nonce("a.krgn", 9)).await, ST_OK);
+        assert_eq!(c.status(OP_SMT_VERIFY, &record_with_nonce("c.krgn", 5)).await, ST_OK);
+        assert_eq!(c.status(OP_SMT_VERIFY, &record_with_nonce("a.krgn", 9)).await, ST_OK);
+        assert_eq!(c.status(OP_SMT_VERIFY, &record_with_nonce("a.krgn", 1)).await, ST_NOT_FOUND);
+        assert_eq!(c.status(OP_BATCH_ABORT, b"").await, ST_OK);
+        assert_eq!(c.status(OP_SMT_VERIFY, &record_with_nonce("c.krgn", 5)).await, ST_NOT_FOUND);
+        assert_eq!(c.status(OP_SMT_VERIFY, &record_with_nonce("a.krgn", 1)).await, ST_OK);
+    }
+
+    /// PUT and DELETE past the batch limit are refused without failing the batch, which
+    /// still commits exactly what it queued. Outside a batch there is no limit.
+    #[tokio::test]
+    async fn the_raw_batch_limit_leaves_the_batch_usable() {
+        let mut c = Client::start_with("limit-raw", settings(3));
+        assert_eq!(c.status(OP_BATCH_START, b"").await, ST_OK);
+        for k in [b"\x90a", b"\x90b", b"\x90c"] {
+            assert_eq!(c.status(OP_PUT, &put(k, b"v")).await, ST_QUEUED);
+        }
+        assert_eq!(c.status(OP_PUT, &put(b"\x90d", b"v")).await, ST_BATCH_TOO_LARGE);
+        assert_eq!(c.status(OP_DELETE, b"\x90a").await, ST_BATCH_TOO_LARGE);
+        assert_eq!(c.status(OP_GET, b"\x90c").await, ST_OK);
+        assert_eq!(c.status(OP_BATCH_COMMIT, b"").await, ST_OK);
+        assert!(c.db.get(b"\x90c").unwrap().is_some());
+        assert!(c.db.get(b"\x90d").unwrap().is_none());
+        for k in [b"\x90e", b"\x90f", b"\x90g", b"\x90h"] {
+            assert_eq!(c.status(OP_PUT, &put(k, b"v")).await, ST_OK);
+        }
+    }
+
+    /// The batch limit counts a worst-case update (NODES_PER_UPDATE): exactly one fits a
+    /// limit of that size, and a refused update leaves the batch committable.
+    #[tokio::test]
+    async fn the_update_batch_limit_counts_a_worst_case_update() {
+        let mut c = Client::start_with("limit-smt", settings(NODES_PER_UPDATE));
+        assert_eq!(c.status(OP_BATCH_START, b"").await, ST_OK);
+        let (st, root) = c.call(OP_SMT_UPDATE, &record("a.krgn")).await;
+        assert_eq!(st, ST_OK);
+        assert_eq!(c.status(OP_SMT_UPDATE, &record("b.krgn")).await, ST_BATCH_TOO_LARGE);
+        assert_eq!(c.call(OP_SMT_ROOT, b"").await.1, root);
+        assert_eq!(c.status(OP_BATCH_COMMIT, b"").await, ST_OK);
+        assert_eq!(c.call(OP_SMT_ROOT, b"").await.1, root);
+        assert_eq!(c.status(OP_SMT_LEAF, b"b.krgn").await, ST_NOT_FOUND);
+
+        // One short of the worst case: no update fits in a batch, but outside one it is fine.
+        let mut d = Client::start_with("limit-smt-short", settings(NODES_PER_UPDATE - 1));
+        assert_eq!(d.status(OP_BATCH_START, b"").await, ST_OK);
+        assert_eq!(d.status(OP_SMT_UPDATE, &record("a.krgn")).await, ST_BATCH_TOO_LARGE);
+        assert_eq!(d.status(OP_BATCH_ABORT, b"").await, ST_OK);
+        assert_eq!(d.call(OP_SMT_UPDATE, &record("a.krgn")).await, (ST_OK, root));
+    }
+
+    /// CLEAR removes every key, tree and raw, and the tree rebuilt after it hashes as a
+    /// fresh one. An empty or single-key database clears too.
+    #[tokio::test]
+    async fn clear_wipes_everything_and_the_tree_restarts_from_empty() {
+        let mut fresh = Client::start("clear-fresh");
+        let empty_root = fresh.call(OP_SMT_ROOT, b"").await.1;
+        let only_z = fresh.call(OP_SMT_UPDATE, &record_with_nonce("z.krgn", 3)).await.1;
+
+        let mut c = Client::start("clear");
+        for (i, d) in ["a.krgn", "b.krgn", "c.krgn"].iter().enumerate() {
+            assert_eq!(c.status(OP_SMT_UPDATE, &record_with_nonce(d, i as u64 + 1)).await, ST_OK);
+        }
+        assert_eq!(c.status(OP_PUT, &put(b"\x90raw", b"v")).await, ST_OK);
+        assert_ne!(c.call(OP_SMT_ROOT, b"").await.1, empty_root);
+
+        assert_eq!(c.status(OP_CLEAR, b"").await, ST_OK);
+        assert!(c.db.iterator(IteratorMode::Start).next().is_none(), "no key survives");
+        assert_eq!(c.call(OP_SMT_ROOT, b"").await.1, empty_root);
+        assert_eq!(c.status(OP_SMT_LEAF, b"a.krgn").await, ST_NOT_FOUND);
+        assert_eq!(c.status(OP_GET, b"\x90raw").await, ST_NOT_FOUND);
+        assert_eq!(c.status(OP_CLEAR, b"").await, ST_OK, "an empty database");
+        assert_eq!(c.call(OP_SMT_UPDATE, &record_with_nonce("z.krgn", 3)).await.1, only_z);
+        assert_eq!(c.status(OP_CLEAR, b"").await, ST_OK);
+        assert_eq!(c.status(OP_PUT, &put(b"\x90one", b"v")).await, ST_OK);
+        assert_eq!(c.status(OP_CLEAR, b"").await, ST_OK, "a single-key database");
+        assert!(c.db.iterator(IteratorMode::Start).next().is_none());
+    }
+
+    /// One writer at a time: while a connection has a batch open, another's writes are
+    /// refused BUSY and change nothing, while its reads see the committed tree. The lock
+    /// is free again after the commit, and when a writer's connection closes mid-batch.
+    /// Without it the second connection's acknowledged update was lost at the commit.
+    #[tokio::test]
+    async fn a_second_writer_is_refused_while_a_batch_is_open() {
+        let mut a = Client::start("writers");
+        let mut b = a.another();
+        let empty_root = b.call(OP_SMT_ROOT, b"").await.1;
+
+        assert_eq!(a.status(OP_BATCH_START, b"").await, ST_OK);
+        assert_eq!(a.status(OP_SMT_UPDATE, &record("a.krgn")).await, ST_OK);
+        let busy = (ST_BUSY, b"another connection is writing".to_vec());
+        for (op, payload) in [
+            (OP_SMT_UPDATE, record("b.krgn")),
+            (OP_PUT, put(b"\x90k", b"v")),
+            (OP_DELETE, b"\x90k".to_vec()),
+            (OP_CLEAR, Vec::new()),
+            (OP_BATCH_START, Vec::new()),
+        ] {
+            assert_eq!(b.call(op, &payload).await, busy, "opcode 0x{op:02x}");
+        }
+        // Reads are never refused, and see only what is committed.
+        assert_eq!(b.call(OP_SMT_ROOT, b"").await.1, empty_root);
+        assert_eq!(b.status(OP_SMT_LEAF, b"a.krgn").await, ST_NOT_FOUND);
+        assert_eq!(b.status(OP_PING, b"").await, ST_OK);
+        // The writer itself is not refused anything.
+        assert_eq!(a.status(OP_PUT, &put(b"\x90k", b"v")).await, ST_QUEUED);
+        assert_eq!(a.status(OP_BATCH_COMMIT, b"").await, ST_OK);
+        assert!(b.db.get(b"\x90k").unwrap().is_some());
+
+        // Free again: b's update lands on top of a's, as through one connection.
+        let (st, root) = b.call(OP_SMT_UPDATE, &record("b.krgn")).await;
+        assert_eq!(st, ST_OK);
+        let mut reference = Client::start("writers-ref");
+        reference.call(OP_SMT_UPDATE, &record("a.krgn")).await;
+        assert_eq!(reference.call(OP_SMT_UPDATE, &record("b.krgn")).await.1, root);
+        assert_eq!(a.status(OP_SMT_LEAF, b"b.krgn").await, ST_OK);
+
+        // A writer that goes away mid-batch frees the lock; its batch is dropped.
+        let mut c = a.another();
+        assert_eq!(c.status(OP_BATCH_START, b"").await, ST_OK);
+        assert_eq!(c.status(OP_SMT_UPDATE, &record("c.krgn")).await, ST_OK);
+        assert_eq!(b.status(OP_SMT_UPDATE, &record("d.krgn")).await, ST_BUSY);
+        drop(c);
+        let mut freed = false;
+        for _ in 0..200 {
+            match b.status(OP_SMT_UPDATE, &record("d.krgn")).await {
+                ST_OK => {
+                    freed = true;
+                    break;
+                }
+                st => {
+                    assert_eq!(st, ST_BUSY);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+        assert!(freed, "the lock is freed when its connection closes");
+        assert_eq!(b.status(OP_SMT_LEAF, b"c.krgn").await, ST_NOT_FOUND);
+    }
+
+    /// A connection that sends nothing past the idle limit is closed, but never while it
+    /// has a batch open.
+    #[tokio::test]
+    async fn an_idle_connection_is_closed_but_not_inside_a_batch() {
+        let idle = Duration::from_secs(1);
+        let mut c = Client::start_with(
+            "idle",
+            Settings {
+                idle_timeout: Some(idle),
+                ..settings(10_000)
+            },
+        );
+        assert_eq!(c.status(OP_BATCH_START, b"").await, ST_OK);
+        tokio::time::sleep(idle * 2).await;
+        assert_eq!(c.status(OP_PING, b"").await, ST_OK, "a batch keeps the connection open");
+        assert_eq!(c.status(OP_BATCH_ABORT, b"").await, ST_OK);
+        tokio::time::sleep(idle * 2).await;
+        let mut byte = [0u8; 1];
+        assert_eq!(c.stream.read(&mut byte).await.unwrap(), 0, "closed once idle");
+    }
+
+    /// The accept loop refuses a connection past the limit, and on shutdown it stops and
+    /// the open connections drain.
+    #[tokio::test]
+    async fn the_connection_limit_refuses_and_shutdown_drains() {
+        let dir = std::env::temp_dir().join(format!("rr-proxy-serve-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s.sock");
+        let listener = bind_socket(&sock, 0o600).unwrap();
+        let db = Arc::new(DB::open_default(dir.join("db")).unwrap());
+        let shared = Shared {
+            db,
+            tree: Arc::new(Smt::new()),
+            writers: Arc::new(WriterLock::default()),
+            settings: settings(10_000),
+        };
+        let connections = Arc::new(Semaphore::new(1));
+        let (tx, rx) = broadcast::channel(1);
+        let server = tokio::spawn(serve(listener, shared, Arc::clone(&connections), 1, rx, tx.clone()));
+
+        let frame = |op: u8| vec![op, 0, 0, 0, 0];
+        let mut answer = [0u8; 5];
+        let mut first = UnixStream::connect(&sock).await.unwrap();
+        first.write_all(&frame(OP_PING)).await.unwrap();
+        first.read_exact(&mut answer).await.unwrap();
+        assert_eq!(answer[0], ST_OK);
+
+        // The one permit is taken: the next connection is closed without an answer.
+        let mut second = UnixStream::connect(&sock).await.unwrap();
+        let _ = second.write_all(&frame(OP_PING)).await;
+        let mut byte = [0u8; 1];
+        assert_eq!(second.read(&mut byte).await.unwrap_or(0), 0, "refused");
+        first.write_all(&frame(OP_PING)).await.unwrap();
+        first.read_exact(&mut answer).await.unwrap();
+        assert_eq!(answer[0], ST_OK, "the first connection still works");
+
+        tx.send(()).unwrap();
+        server.await.unwrap();
+        assert!(drain(&connections, 1, Duration::from_secs(5)).await, "the idle connection drained");
+        assert_eq!(first.read(&mut byte).await.unwrap_or(0), 0, "and was closed");
+        assert!(UnixStream::connect(&sock).await.is_err(), "nothing accepts any more");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// bind_socket keeps and refuses a regular file at the socket path or its temporary
+    /// path, never follows or removes a symlink, and replaces a stale socket.
+    #[test]
+    fn bind_socket_refuses_what_is_not_a_stale_socket() {
+        let dir = std::env::temp_dir().join(format!("rr-proxy-bind-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("x.sock");
+
+        fs::write(&sock, b"keep").unwrap();
+        assert!(bind_socket(&sock, 0o660).is_err());
+        assert_eq!(fs::read(&sock).unwrap(), b"keep");
+        fs::remove_file(&sock).unwrap();
+
+        let tmp = sock.with_extension("binding");
+        fs::write(&tmp, b"keep2").unwrap();
+        assert!(bind_socket(&sock, 0o660).is_err());
+        assert_eq!(fs::read(&tmp).unwrap(), b"keep2");
+        fs::remove_file(&tmp).unwrap();
+
+        let target = dir.join("real.sock");
+        let _keep = std::os::unix::net::UnixListener::bind(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &sock).unwrap();
+        assert!(bind_socket(&sock, 0o660).is_err());
+        assert!(fs::symlink_metadata(&sock).unwrap().file_type().is_symlink());
+        fs::remove_file(&sock).unwrap();
+
+        // bind_socket hands the socket to tokio, which needs a runtime.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let _stale = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let listener = bind_socket(&sock, 0o640).unwrap();
+            let meta = fs::symlink_metadata(&sock).unwrap();
+            assert!(meta.file_type().is_socket());
+            assert_eq!(meta.permissions().mode() & 0o777, 0o640);
+            assert!(fs::symlink_metadata(&tmp).is_err(), "no temporary path is left");
+            drop(listener);
+        });
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -37,6 +37,12 @@ pub const OP_SMT_LEAF: u8 = 0x41;
 pub const OP_SMT_UPDATE: u8 = 0x42;
 pub const OP_SMT_PROOF: u8 = 0x43;
 pub const OP_SMT_VERIFY: u8 = 0x44;
+pub const OP_SMT_PROOFS: u8 = 0x45;
+
+/// The most domains one `SMT_PROOFS` request may name. Each proof is read in
+/// one blocking task holding one snapshot, so the list is bounded; the indexer
+/// asks for at most 500 at a time.
+pub const MAX_PROOFS_PER_REQUEST: usize = 1000;
 
 // ---- Status codes ----
 
@@ -48,6 +54,9 @@ pub const ST_BAD_COMMAND: u8 = 0x03;
 pub const ST_QUEUED: u8 = 0x04;
 pub const ST_BATCH_TOO_LARGE: u8 = 0x05;
 pub const ST_ALREADY_IN_BATCH: u8 = 0x06;
+/// A write refused because another connection is writing (has a batch open, or a
+/// write running). Nothing was done; reads are never refused this way.
+pub const ST_BUSY: u8 = 0x07;
 
 /// Bytes in a node hash.
 pub const HASH_LEN: usize = 32;
@@ -231,6 +240,33 @@ pub fn encode_record(record: &kns_core::LeafRecord) -> Vec<u8> {
 pub fn encode_proof(root: &[u8; HASH_LEN], proof: &kns_core::Proof) -> Vec<u8> {
     let mut out = Vec::with_capacity(HASH_LEN * (2 + proof.siblings.len()));
     out.extend_from_slice(root);
+    encode_proof_body(&mut out, proof);
+    out
+}
+
+/// Serialises the roots and proofs for `SMT_PROOFS`: one root, then each proof
+/// as `SMT_PROOF` sends it without the root, length-prefixed, in request order.
+///
+/// ```text
+/// [root: 32][count: u32]
+/// count × [length: u32][depth: u8][terminal: u8][siblings: 32 * depth][record, if BLOCKED]
+/// ```
+pub fn encode_proofs(root: &[u8; HASH_LEN], proofs: &[kns_core::Proof]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HASH_LEN + 4 + proofs.len() * HASH_LEN * 24);
+    out.extend_from_slice(root);
+    out.extend_from_slice(&(proofs.len() as u32).to_be_bytes());
+    let mut body = Vec::with_capacity(HASH_LEN * 24);
+    for proof in proofs {
+        body.clear();
+        encode_proof_body(&mut body, proof);
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+    }
+    out
+}
+
+/// A proof as both `SMT_PROOF` and `SMT_PROOFS` send it after the root.
+fn encode_proof_body(out: &mut Vec<u8>, proof: &kns_core::Proof) {
     out.push(proof.depth);
     out.push(match &proof.terminal {
         kns_core::Terminal::Occupied => TERMINAL_OCCUPIED,
@@ -243,13 +279,33 @@ pub fn encode_proof(root: &[u8; HASH_LEN], proof: &kns_core::Proof) -> Vec<u8> {
     if let kns_core::Terminal::Blocked { record } = &proof.terminal {
         out.extend_from_slice(&encode_record(record));
     }
-    out
 }
 
 /// Interprets a payload as a non-empty UTF-8 domain name.
 pub fn parse_domain(payload: &[u8]) -> Option<&str> {
     let domain = std::str::from_utf8(payload).ok()?;
     if domain.is_empty() { None } else { Some(domain) }
+}
+
+/// Splits an `SMT_PROOFS` payload, `[u32 length][domain]` repeated, into its
+/// domains. `None` when it names none or more than `max`, when a domain is empty
+/// or not UTF-8, or when it ends inside an entry.
+pub fn parse_domains(payload: &[u8], max: usize) -> Option<Vec<String>> {
+    let mut domains = Vec::new();
+    let mut rest = payload;
+    while !rest.is_empty() {
+        if domains.len() == max || rest.len() < 4 {
+            return None;
+        }
+        let len = u32::from_be_bytes(rest[..4].try_into().ok()?) as usize;
+        rest = &rest[4..];
+        if len > rest.len() {
+            return None;
+        }
+        domains.push(parse_domain(&rest[..len])?.to_string());
+        rest = &rest[len..];
+    }
+    if domains.is_empty() { None } else { Some(domains) }
 }
 
 #[cfg(test)]
@@ -488,5 +544,73 @@ mod tests {
         assert_eq!(parse_domain(b"alice.zec"), Some("alice.zec"));
         assert_eq!(parse_domain(b""), None);
         assert_eq!(parse_domain(&[0xff, 0xfe]), None);
+    }
+
+    fn domains_payload(domains: &[&[u8]]) -> Vec<u8> {
+        let mut p = Vec::new();
+        for d in domains {
+            p.extend_from_slice(&(d.len() as u32).to_be_bytes());
+            p.extend_from_slice(d);
+        }
+        p
+    }
+
+    #[test]
+    fn parses_domain_lists() {
+        assert_eq!(
+            parse_domains(&domains_payload(&[b"alice.krgn", b"bob.krgn"]), 10),
+            Some(vec!["alice.krgn".to_string(), "bob.krgn".to_string()])
+        );
+        assert_eq!(parse_domains(&domains_payload(&[b"a", b"b", b"c"]), 3).map(|d| d.len()), Some(3));
+    }
+
+    #[test]
+    fn rejects_malformed_domain_lists() {
+        // Nothing named.
+        assert!(parse_domains(b"", 10).is_none());
+        // More than allowed.
+        assert!(parse_domains(&domains_payload(&[b"a", b"b", b"c"]), 2).is_none());
+        // An empty or non-UTF-8 domain.
+        assert!(parse_domains(&domains_payload(&[b"a", b""]), 10).is_none());
+        assert!(parse_domains(&domains_payload(&[b"a", &[0xff, 0xfe]]), 10).is_none());
+        // Ends inside a length prefix, or inside a domain.
+        let mut p = domains_payload(&[b"alice.krgn"]);
+        p.extend_from_slice(&[0, 0]);
+        assert!(parse_domains(&p, 10).is_none());
+        let mut p = domains_payload(&[b"alice.krgn"]);
+        p.pop();
+        assert!(parse_domains(&p, 10).is_none());
+    }
+
+    #[test]
+    fn proof_list_is_each_single_proof_after_one_root() {
+        let root = [7u8; HASH_LEN];
+        let blocked = kns_core::Proof {
+            depth: 2,
+            siblings: vec![[1u8; HASH_LEN], [2u8; HASH_LEN]],
+            terminal: kns_core::Terminal::Blocked {
+                record: kns_core::LeafRecord {
+                    domain: "bob.krgn".into(),
+                    pubkey: [3u8; HASH_LEN],
+                    target_address: "ps1x".into(),
+                    price: 5,
+                    nonce: 9,
+                },
+            },
+        };
+        let vacant = kns_core::Proof { depth: 0, siblings: vec![], terminal: kns_core::Terminal::Vacant };
+        let proofs = [blocked, vacant];
+
+        let out = encode_proofs(&root, &proofs);
+        assert_eq!(&out[..HASH_LEN], &root);
+        assert_eq!(&out[HASH_LEN..HASH_LEN + 4], &2u32.to_be_bytes());
+        let mut rest = &out[HASH_LEN + 4..];
+        for proof in &proofs {
+            let single = encode_proof(&root, proof);
+            let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+            assert_eq!(&rest[4..4 + len], &single[HASH_LEN..]);
+            rest = &rest[4 + len..];
+        }
+        assert!(rest.is_empty());
     }
 }
